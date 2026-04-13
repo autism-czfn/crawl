@@ -33,7 +33,7 @@ class CrawledItem(Base):
     journal = Column(Text, nullable=True)
     open_access = Column(Boolean, nullable=True)
     raw_payload = Column(JSONB, nullable=True)
-    embedding = Column(Vector(1536), nullable=True)
+    embedding = Column(Vector(768), nullable=True)
     embedding_model = Column(Text, nullable=True)
     embedded_at = Column(DateTime(timezone=True), nullable=True)
 

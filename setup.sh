@@ -251,6 +251,73 @@ create_superuser() {
     echo
 }
 
+# ── Option 7 — DB Stats ────────────────────────────────────────────────────────
+show_db_stats() {
+    echo
+    info "=== Database & Crawl Stats ==="
+    echo
+
+    if [[ ! -f .env ]]; then
+        error ".env not found — cannot determine DATABASE_URL."
+        echo; return
+    fi
+
+    # Use the project's own Python/psycopg2 — no psql needed
+    "$PYTHON" - << 'PYEOF'
+import os, sys, json, pathlib
+
+# ── Load .env ──
+for line in pathlib.Path(".env").read_text().splitlines():
+    line = line.strip()
+    if line and not line.startswith("#") and "=" in line:
+        k, _, v = line.partition("=")
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+db_url = os.environ.get("DATABASE_URL", "")
+if not db_url:
+    print("  \033[0;31m[ERROR]\033[0m  DATABASE_URL not set in .env")
+    sys.exit(1)
+
+# Strip SQLAlchemy driver prefix (e.g. postgresql+asyncpg:// → postgresql://)
+import re
+db_url = re.sub(r"^(postgresql)\+\w+://", r"\1://", db_url)
+
+BOLD  = "\033[1m"
+GREEN = "\033[0;32m"
+WARN  = "\033[1;33m"
+ERR   = "\033[0;31m"
+RESET = "\033[0m"
+
+# ── DB size & crawled items ──
+db_size = item_count = "N/A"
+try:
+    import psycopg2
+    conn = psycopg2.connect(db_url)
+    cur  = conn.cursor()
+    cur.execute("SELECT pg_size_pretty(pg_database_size(current_database()));")
+    db_size = cur.fetchone()[0].strip()
+    cur.execute("SELECT COUNT(*) FROM crawled_items;")
+    item_count = f"{cur.fetchone()[0]:,}"
+    cur.close()
+    conn.close()
+except Exception as e:
+    print(f"  {WARN}[WARN]{RESET}   DB query failed: {e}")
+
+# ── Active sources from surfaces.json ──
+source_count = "N/A"
+try:
+    surfaces = json.loads(pathlib.Path("config/surfaces.json").read_text())
+    source_count = sum(1 for s in surfaces if s.get("enabled", True))
+except Exception as e:
+    print(f"  {WARN}[WARN]{RESET}   Could not read surfaces.json: {e}")
+
+print(f"  {BOLD}DB Size:       {RESET}{GREEN}{db_size}{RESET}")
+print(f"  {BOLD}Crawled Items: {RESET}{GREEN}{item_count}{RESET}")
+print(f"  {BOLD}Active Sources:{RESET}{GREEN}{source_count}{RESET}  (config/surfaces.json)")
+print()
+PYEOF
+}
+
 # ── Option 2 — Status ──────────────────────────────────────────────────────────
 check_status() {
     echo
@@ -292,9 +359,10 @@ print_menu() {
     echo -e "  ${CYAN}4)${RESET} Show admin URLs"
     echo -e "  ${YELLOW}5)${RESET} Create Django superuser"
     echo -e "  ${RED}6)${RESET} Stop all services     (crawler + Django admin)"
+    echo -e "  ${CYAN}7)${RESET} Show DB stats         (size / crawled items / sources)"
     echo -e "  ${RED}0)${RESET} Exit"
     echo
-    echo -n "  Select an option [0-6]: "
+    echo -n "  Select an option [0-7]: "
 }
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -311,6 +379,7 @@ while true; do
         4) show_urls         ;;
         5) create_superuser  ;;
         6) stop_all          ;;
+        7) show_db_stats     ;;
         0)
             echo
             info "Goodbye."
@@ -318,7 +387,7 @@ while true; do
             exit 0
             ;;
         *)
-            error "Invalid option '${choice}'. Please enter 0–6."
+            error "Invalid option '${choice}'. Please enter 0–7."
             ;;
     esac
 done

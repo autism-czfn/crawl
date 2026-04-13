@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from src.config import settings
+from src.captions import run_loop as caption_loop
 from src.embeddings import run_loop as embedding_loop
 from src.scheduler import Scheduler
 
@@ -14,6 +15,7 @@ async def main() -> None:
     await asyncio.gather(
         scheduler.run(),
         embedding_loop(),
+        caption_loop(),
     )
 
 

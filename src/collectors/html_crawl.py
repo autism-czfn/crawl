@@ -48,6 +48,12 @@ _SITE_SELECTORS: dict[str, dict[str, str]] = {
         "author": "span.author-name",
         "date": "span.article-header-date",
     },
+    "aacap.org": {
+        "title": "h1, h2.page-title, .PageTitle",
+        "body": "#TextContent, .content-area, #mainContent",
+        "author": "",
+        "date": "",
+    },
 }
 
 _simulator = HumanBehaviorSimulator()

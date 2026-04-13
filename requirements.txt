@@ -11,6 +11,7 @@ praw>=7.7.0
 pgvector>=0.3.0
 fastembed>=0.4
 python-dateutil>=2.9.0
+playwright>=1.44.0
 
 # Django admin site
 django>=4.2.0

@@ -33,6 +33,7 @@ _COLLECTOR_MAP: dict[str, str] = {
     "youtube": "src.collectors.youtube",
     "newsapi": "src.collectors.newsapi",
     "html_crawl": "src.collectors.html_crawl",
+    "playwright_crawl": "src.collectors.playwright_crawl",
 }
 
 _SURFACES_JSON = Path(__file__).parent.parent / "config" / "surfaces.json"

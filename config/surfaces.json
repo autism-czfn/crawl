@@ -24,11 +24,53 @@
 
   {"key": "hn_autism",               "platform": "hackernews",      "poll_interval_sec": 3600,  "max_items": 20, "config": {"query": "autism", "min_points": 10}},
   {"key": "youtube_autism",          "platform": "youtube",         "poll_interval_sec": 7200,  "max_items": 20, "config": {"query": "autism", "min_views": 1000}},
+
+  {"key": "yt_autism_speaks",         "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "AutismSpeaks"}},
+  {"key": "yt_cdc",                   "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "CDC",                 "query": "autism"}},
+  {"key": "yt_nimh",                  "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "nimhgov",              "query": "autism"}},
+  {"key": "yt_who",                   "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "who",                  "query": "autism"}},
+  {"key": "yt_nhs",                   "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "nhs",                  "query": "autism"}},
+  {"key": "yt_asan",                  "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "AutisticSelfAdvocacy"}},
+  {"key": "yt_national_autistic",     "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "NationalAutisticSociety"}},
+  {"key": "yt_autism_ontario",        "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "AutismOntario"}},
+  {"key": "yt_autism_crc",            "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "AutismCRC"}},
+  {"key": "yt_child_mind",            "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "ChildMindInstitute",   "query": "autism"}},
+  {"key": "yt_yale_child_study",      "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "YaleChildStudyCenter"}},
+  {"key": "yt_ucdavis_mind",          "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "MINDInstituteUC"}},
+  {"key": "yt_kennedy_krieger",       "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "KennedyKriegerInstitute"}},
+  {"key": "yt_marcus_autism",         "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "MarcusAutismCenter"}},
+  {"key": "yt_seattle_childrens",     "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "SeattleChildrens",    "query": "autism"}},
+  {"key": "yt_autism_from_inside",    "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "autismfromtheinside"}},
+  {"key": "yt_aspie_world",           "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "TheAspieWorld"}},
+  {"key": "yt_yo_samdy_sam",          "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "YoSamdySam"}},
+  {"key": "yt_purple_ella",           "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "PurpleElla"}},
+  {"key": "yt_how_to_adhd",           "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "HowtoADHD",           "query": "autism"}},
+  {"key": "yt_ncld",                 "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "LdOrg"}},
+  {"key": "yt_hands_autism",          "platform": "youtube", "poll_interval_sec": 7200, "max_items": 20, "config": {"channel_handle": "HANDSinAutismProgram"}},
   {"key": "newsapi_autism",          "platform": "newsapi",         "poll_interval_sec": 3600,  "max_items": 30, "config": {"query": "autism OR autistic OR \"autism spectrum\""}},
 
   {"key": "wrongplanet",               "platform": "html_crawl", "enabled": false, "poll_interval_sec": 7200,  "max_items": 30, "config": {"base_url": "https://wrongplanet.net/forums/"}},
   {"key": "autism_society",            "platform": "html_crawl", "poll_interval_sec": 14400, "max_items": 20, "config": {"base_url": "https://autism-society.org/news/"}},
   {"key": "autism_science_foundation", "platform": "html_crawl", "poll_interval_sec": 14400, "max_items": 20, "config": {"base_url": "https://autismsciencefoundation.org/blog/"}},
   {"key": "frontiers_neuro",           "platform": "html_crawl", "poll_interval_sec": 21600, "max_items": 20, "config": {"base_url": "https://www.frontiersin.org/journals/neuroscience"}},
-  {"key": "autism_spectrum_news",      "platform": "html_crawl", "poll_interval_sec": 14400, "max_items": 20, "config": {"base_url": "https://autismspectrumnews.org/"}}
+  {"key": "autism_spectrum_news",      "platform": "html_crawl", "poll_interval_sec": 14400, "max_items": 20, "config": {"base_url": "https://autismspectrumnews.org/"}},
+
+  {"key": "cdc_autism",                "platform": "html_crawl", "poll_interval_sec": 86400, "max_items": 15, "config": {"base_url": "https://www.cdc.gov/autism/"}},
+  {"key": "cdc_milestones",            "platform": "html_crawl", "poll_interval_sec": 86400, "max_items": 15, "config": {"base_url": "https://www.cdc.gov/ncbddd/actearly/milestones/"}},
+  {"key": "cdc_seed",                  "platform": "html_crawl", "poll_interval_sec": 86400, "max_items": 15, "config": {"base_url": "https://www.cdc.gov/ncbddd/autism/seed.html"}},
+
+  {"key": "aacap_autism",              "platform": "html_crawl", "enabled": false, "poll_interval_sec": 86400, "max_items": 15, "config": {"base_url": "https://www.aacap.org/AACAP/Families_and_Youth/Resource_Centers/Autism_Resource_Center/Home.aspx"}},
+  {"key": "aap_autism",                "platform": "html_crawl", "poll_interval_sec": 86400, "max_items": 15, "config": {"base_url": "https://www.aap.org/en/patient-care/autism/"}},
+  {"key": "nimh_autism",               "platform": "html_crawl", "poll_interval_sec": 86400, "max_items": 15, "config": {"base_url": "https://www.nimh.nih.gov/health/topics/autism-spectrum-disorders-asd"}},
+  {"key": "nice_autism",               "platform": "html_crawl", "poll_interval_sec": 86400, "max_items": 15, "config": {"base_url": "https://www.nice.org.uk/guidance/conditions-and-diseases/mental-health-behavioural-and-neurodevelopmental-conditions/autism"}},
+
+  {"key": "autism_navigator",          "platform": "html_crawl", "poll_interval_sec": 43200, "max_items": 20, "config": {"base_url": "https://autismnavigator.com/"}},
+  {"key": "nimh_data_archive",         "platform": "html_crawl", "poll_interval_sec": 43200, "max_items": 20, "config": {"base_url": "https://nda.nih.gov/"}},
+  {"key": "spark_autism",              "platform": "html_crawl", "poll_interval_sec": 43200, "max_items": 20, "config": {"base_url": "https://sparkforautism.org/"}},
+
+  {"key": "hhs_hipaa_security",        "platform": "html_crawl", "poll_interval_sec": 86400, "max_items": 10, "config": {"base_url": "https://www.hhs.gov/hipaa/for-professionals/security/"}},
+  {"key": "fda_cds_guidance",          "platform": "html_crawl", "poll_interval_sec": 86400, "max_items": 10, "config": {"base_url": "https://www.fda.gov/medical-devices/software-medical-device-samd/clinical-decision-support-software"}},
+  {"key": "fda_device_software",       "platform": "html_crawl", "poll_interval_sec": 86400, "max_items": 10, "config": {"base_url": "https://www.fda.gov/medical-devices/digital-health-center-excellence/device-software-functions-including-mobile-medical-applications"}},
+
+  {"key": "insar_resources",          "platform": "playwright_crawl", "enabled": false, "poll_interval_sec": 86400, "max_items": 15, "config": {"start_url": "https://www.autism-insar.org/page/Resources", "wait_selector": "body", "wait_ms": 8000, "follow_links": true, "same_domain_only": true}}
 ]
