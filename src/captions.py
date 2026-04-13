@@ -10,7 +10,7 @@ import logging
 import re
 import subprocess
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import select, update
@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 _BATCH_SIZE = 10
 _INTERVAL_SEC = 600  # 10 minutes
 _DELAY_BETWEEN_VIDEOS = 10  # seconds — avoid YouTube 429 rate limits
+_RETRY_STALE_DAYS = 7       # retry empty-caption videos after this many days
+_RETRY_STALE_LIMIT = 20     # max rows to reset per cycle
 
 
 def _fetch_subtitles(video_url: str) -> str | None:
@@ -159,11 +161,48 @@ async def run_once(batch_size: int = _BATCH_SIZE) -> int:
     return enriched
 
 
+async def _retry_stale() -> int:
+    """Reset content_body to NULL for old empty-caption rows so they get retried.
+
+    Runs once per loop cycle but only resets rows older than _RETRY_STALE_DAYS.
+    """
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=_RETRY_STALE_DAYS)
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(CrawledItem.id)
+            .where(CrawledItem.source == "youtube")
+            .where(CrawledItem.content_body == "")
+            .where(CrawledItem.collected_at < cutoff)
+            .limit(_RETRY_STALE_LIMIT)
+        )
+        ids = [r.id for r in result.fetchall()]
+
+        if not ids:
+            return 0
+
+        await session.execute(
+            update(CrawledItem)
+            .where(CrawledItem.id.in_(ids))
+            .values(content_body=None)
+        )
+        await session.commit()
+
+    logger.info("Caption retry: reset %d stale empty-caption rows for re-processing", len(ids))
+    return len(ids)
+
+
 async def run_loop() -> None:
     """Long-running loop that calls run_once every 10 minutes."""
     logger.info("Caption enrichment loop started (interval=%ds)", _INTERVAL_SEC)
+    cycle = 0
     while True:
         try:
+            # Retry stale empty-caption rows once every 6 cycles (~1 hour)
+            cycle += 1
+            if cycle % 6 == 0:
+                await _retry_stale()
+
             count = await run_once()
             if count:
                 logger.info("Caption enrichment run complete: %d videos enriched", count)
