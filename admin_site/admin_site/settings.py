@@ -21,7 +21,7 @@ DEBUG = os.environ.get("DJANGO_DEBUG", "true").lower() == "true"
 ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",")
 CSRF_TRUSTED_ORIGINS = os.environ.get(
     "DJANGO_CSRF_TRUSTED_ORIGINS",
-    "https://108.28.10.199,https://127.0.0.1",
+    "http://127.0.0.1",
 ).split(",")
 
 # ── Applications ────────────────────────────────────────────────────────────

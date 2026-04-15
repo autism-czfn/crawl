@@ -56,6 +56,30 @@ install_deps() {
     success "Dependencies installed."
 }
 
+# ── Public IP → .env ──────────────────────────────────────────────────────────
+update_csrf_origins() {
+    local public_ip
+    public_ip=$(curl -sf --max-time 5 https://ifconfig.me \
+             || curl -sf --max-time 5 https://api.ipify.org \
+             || curl -sf --max-time 5 https://icanhazip.com \
+             || true)
+
+    if [[ -z "$public_ip" ]]; then
+        warn "Could not detect public IP — DJANGO_CSRF_TRUSTED_ORIGINS left unchanged."
+        return
+    fi
+
+    local origins="https://${public_ip},http://127.0.0.1,http://localhost"
+
+    if grep -q "^DJANGO_CSRF_TRUSTED_ORIGINS=" .env; then
+        sed -i "s|^DJANGO_CSRF_TRUSTED_ORIGINS=.*|DJANGO_CSRF_TRUSTED_ORIGINS=${origins}|" .env
+    else
+        echo "DJANGO_CSRF_TRUSTED_ORIGINS=${origins}" >> .env
+    fi
+
+    success "DJANGO_CSRF_TRUSTED_ORIGINS set to: ${origins}"
+}
+
 # ── Migrations ─────────────────────────────────────────────────────────────────
 run_migrations() {
     info "Running database migrations ..."
@@ -99,6 +123,7 @@ stop_existing() {
 start_restart_all() {
     echo
     check_env
+    update_csrf_origins
     install_deps
     run_migrations
 
@@ -139,7 +164,9 @@ start_restart_all() {
 
     sleep 2
     if kill -0 "$admin_pid" 2>/dev/null; then
-        success "Django admin started  (PID $admin_pid)  →  http://localhost:${ADMIN_PORT}/admin/"
+        local public_ip
+        public_ip=$(grep "^DJANGO_CSRF_TRUSTED_ORIGINS=" .env | grep -oP 'https://\K[^,]+' | head -1)
+        success "Django admin started  (PID $admin_pid)  →  https://${public_ip}/admin/"
     else
         error "Django admin exited immediately. Check logs:"
         tail -20 "$ADMIN_LOG_FILE"
