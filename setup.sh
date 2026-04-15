@@ -455,6 +455,46 @@ _pg_is_installed() {
     return 1
 }
 
+_pg_rhel_enable_pg16_module() {
+    # Fedora removed DNF modules; it ships PostgreSQL directly (usually already ≥16).
+    if [[ "$PG_OS_ID" == "fedora" ]]; then
+        return 0
+    fi
+    info "Enabling postgresql:16 module stream ..."
+    $PG_SUDO dnf -qy module reset postgresql >/dev/null 2>&1 || true
+    if ! $PG_SUDO dnf -qy module enable postgresql:16; then
+        error "Failed to enable postgresql:16 module stream."
+        return 1
+    fi
+    return 0
+}
+
+_pg_debian_add_pgdg_repo() {
+    info "Configuring PGDG apt repository for PostgreSQL 16 ..."
+    $PG_SUDO apt-get update || return 1
+    $PG_SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        curl ca-certificates gnupg lsb-release || return 1
+
+    local keyring="/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"
+    $PG_SUDO install -d /usr/share/postgresql-common/pgdg
+    if [[ ! -f "$keyring" ]]; then
+        curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | $PG_SUDO tee "$keyring" >/dev/null || return 1
+    fi
+
+    local codename
+    codename=$(lsb_release -cs 2>/dev/null)
+    if [[ -z "$codename" ]]; then
+        error "Could not determine distro codename (lsb_release -cs)."
+        return 1
+    fi
+
+    local line="deb [signed-by=${keyring}] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main"
+    echo "$line" | $PG_SUDO tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+    $PG_SUDO apt-get update || return 1
+    return 0
+}
+
 _pg_pkg_install() {
     if _pg_is_installed; then
         info "PostgreSQL already installed — skipping package install."
@@ -462,20 +502,22 @@ _pg_pkg_install() {
     fi
     case "$PG_OS_ID" in
         rhel|centos|rocky|almalinux|fedora)
+            _pg_rhel_enable_pg16_module || return 1
             $PG_SUDO dnf install -y postgresql-server postgresql-contrib
             ;;
         ubuntu|debian)
-            $PG_SUDO apt-get update
-            $PG_SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql postgresql-contrib
+            _pg_debian_add_pgdg_repo || return 1
+            $PG_SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-16 postgresql-contrib-16
             ;;
         *)
             if [[ "$PG_OS_LIKE" == *rhel* || "$PG_OS_LIKE" == *fedora* ]]; then
+                _pg_rhel_enable_pg16_module || return 1
                 $PG_SUDO dnf install -y postgresql-server postgresql-contrib
             elif [[ "$PG_OS_LIKE" == *debian* ]]; then
-                $PG_SUDO apt-get update
-                $PG_SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql postgresql-contrib
+                _pg_debian_add_pgdg_repo || return 1
+                $PG_SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-16 postgresql-contrib-16
             else
-                error "Unsupported OS: $PG_OS_ID ($PG_OS_LIKE). Install PostgreSQL manually."
+                error "Unsupported OS: $PG_OS_ID ($PG_OS_LIKE). Install PostgreSQL 16 manually."
                 return 1
             fi
             ;;
@@ -781,6 +823,25 @@ install_postgres() {
 
     if _pg_is_installed; then
         info "PostgreSQL already installed — skipping install, init, and service start."
+        local existing_major
+        existing_major=$(_pg_major_version)
+        if [[ -n "$existing_major" && "$existing_major" != "16" ]]; then
+            error "Existing PostgreSQL is major version ${existing_major}, but this project requires 16."
+            error "Remove the existing cluster first, then re-run this option."
+            case "$PG_OS_ID" in
+                rhel|centos|rocky|almalinux|fedora)
+                    error "  sudo systemctl stop postgresql"
+                    error "  sudo dnf remove -y postgresql-server postgresql-contrib postgresql"
+                    error "  sudo rm -rf /var/lib/pgsql/data"
+                    ;;
+                ubuntu|debian)
+                    error "  sudo systemctl stop postgresql"
+                    error "  sudo apt-get purge -y 'postgresql-*'"
+                    error "  sudo rm -rf /var/lib/postgresql /etc/postgresql"
+                    ;;
+            esac
+            echo; return
+        fi
         if ! systemctl is-active --quiet postgresql; then
             warn "postgresql service is not active. Start it first: 'sudo systemctl start postgresql'"
             echo; return
