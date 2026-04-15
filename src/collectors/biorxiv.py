@@ -52,7 +52,7 @@ async def collect(
 
     collection = data.get("collection", [])
     messages = data.get("messages", [{}])
-    total = messages[0].get("total", 0) if messages else 0
+    total = int(messages[0].get("total", 0)) if messages else 0
 
     items: list[CollectedItem] = []
     for p in collection:

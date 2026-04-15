@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # Per-site CSS selectors: title / body / author / date
 _SITE_SELECTORS: dict[str, dict[str, str]] = {
-    "autism-society.org": {
+    "autismsociety.org": {
         "title": "h1.entry-title",
         "body": "div.entry-content",
         "author": "span.author",
