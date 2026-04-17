@@ -32,6 +32,11 @@ class CrawledItem(Base):
     doi = Column(Text, nullable=True)
     journal = Column(Text, nullable=True)
     open_access = Column(Boolean, nullable=True)
+    authority_tier = Column(Integer, nullable=True)
+    source_type = Column(Text, nullable=True)
+    audience_type = Column(Text, nullable=True)
+    content_hash = Column(Text, nullable=True)
+    content_updated_at = Column(DateTime(timezone=True), nullable=True)
     raw_payload = Column(JSONB, nullable=True)
     embedding = Column(Vector(768), nullable=True)
     embedding_model = Column(Text, nullable=True)
@@ -45,6 +50,23 @@ class CrawledItem(Base):
     )
 
 
+class Chunk(Base):
+    __tablename__ = "chunks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    crawled_item_id = Column(Integer, nullable=False, index=True)
+    chunk_index = Column(Integer, nullable=False)
+    chunk_text = Column(Text, nullable=False)
+    embedding = Column(Vector(768), nullable=True)
+    embedding_model = Column(Text, nullable=True)
+    embedded_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("crawled_item_id", "chunk_index", name="uq_chunk_item_index"),
+        Index("idx_chunk_item", "crawled_item_id", "chunk_index"),
+    )
+
+
 class Surface(Base):
     __tablename__ = "surfaces"
 
@@ -54,6 +76,13 @@ class Surface(Base):
     poll_interval_sec = Column(Integer, nullable=False, default=3600)
     max_items_per_run = Column(Integer, nullable=False, default=30)
     config_json = Column(JSONB, nullable=True)
+    authority_tier = Column(Integer, nullable=True)
+    source_type = Column(Text, nullable=True)
+    audience_type = Column(Text, nullable=True)
+    language = Column(Text, nullable=True, default="en")
+    country = Column(Text, nullable=True)
+    organization_name = Column(Text, nullable=True)
+    force_recrawl = Column(Boolean, nullable=False, default=False)
     last_run_at = Column(DateTime(timezone=True), nullable=True)
     last_cursor = Column(Text, nullable=True)
     last_status = Column(Text, nullable=True)

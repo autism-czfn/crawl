@@ -1,6 +1,7 @@
 """Ingest pipeline: upserts CollectedItems into the DB and enriches with Unpaywall."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.collectors.base import CollectedItem, normalize_title
-from src.storage.models import CrawledItem
+from src.storage.models import CrawledItem, Surface
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,8 @@ async def save_items(
     """Upsert items into crawled_items. Returns count of newly inserted rows."""
     if not items:
         return 0
+
+    surface = await session.get(Surface, surface_key)
 
     inserted = 0
     for item in items:
@@ -61,6 +64,11 @@ async def save_items(
             "doi": item.get("doi"),
             "journal": item.get("journal"),
             "open_access": item.get("open_access"),
+            "authority_tier": surface.authority_tier if surface else None,
+            "source_type": surface.source_type if surface else None,
+            "audience_type": surface.audience_type if surface else None,
+            "content_hash": _hash_content(item.get("content_body")),
+            "content_updated_at": datetime.now(tz=timezone.utc) if item.get("content_body") else None,
             "raw_payload": item.get("raw_payload") or {},
         }
 
@@ -71,7 +79,13 @@ async def save_items(
                 "engagement": stmt.excluded.engagement,
                 "rank_position": stmt.excluded.rank_position,
                 "description": stmt.excluded.description,
+                "content_body": stmt.excluded.content_body,
+                "content_hash": stmt.excluded.content_hash,
+                "content_updated_at": stmt.excluded.content_updated_at,
                 "collected_at": stmt.excluded.collected_at,
+                "authority_tier": stmt.excluded.authority_tier,
+                "source_type": stmt.excluded.source_type,
+                "audience_type": stmt.excluded.audience_type,
             },
         )
 
@@ -94,6 +108,13 @@ async def save_items(
         return 0
 
     return inserted
+
+
+def _hash_content(content: str | None) -> str | None:
+    """SHA-256 hash of content_body for change detection on re-crawl."""
+    if not content:
+        return None
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------

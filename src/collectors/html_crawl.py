@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import fnmatch
 import re
 from urllib.parse import urljoin, urlparse
 
@@ -21,6 +22,41 @@ from src.http.client import get_shared_client
 from src.http.human import HumanBehaviorSimulator
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_body(soup: BeautifulSoup) -> str | None:
+    """Extract main article body text, stripping nav/footer/sidebar."""
+    # Work on a copy to avoid mutating the original
+    work = BeautifulSoup(str(soup), "html.parser")
+    for tag in work.find_all(["nav", "footer", "aside", "header", "script", "style", "noscript"]):
+        tag.decompose()
+
+    # Try common article body selectors in priority order
+    selectors = [
+        "article",
+        "[role='main']",
+        "main",
+        ".entry-content",
+        ".post-content",
+        ".article-body",
+        ".content-body",
+        "#content",
+        "#main-content",
+    ]
+    for sel in selectors:
+        el = work.select_one(sel)
+        if el:
+            text = el.get_text(" ", strip=True)
+            if len(text) > 100:  # meaningful content
+                return _clean_text(text)
+
+    # Fallback: get body text
+    body = work.find("body")
+    if body:
+        text = body.get_text(" ", strip=True)
+        if len(text) > 100:
+            return _clean_text(text)
+    return None
 
 # Per-site CSS selectors: title / body / author / date
 _SITE_SELECTORS: dict[str, dict[str, str]] = {
@@ -54,6 +90,31 @@ _SITE_SELECTORS: dict[str, dict[str, str]] = {
         "author": "",
         "date": "",
     },
+    # --- Non-English sites ---
+    "has-sante.fr": {
+        "title": "h1",
+        "body": "div.inner-pages",
+        "author": "",
+        "date": "",
+    },
+    "neurologen-und-psychiater-im-netz.org": {
+        "title": "title",  # no h1 on these pages; <title> tag is the best source
+        "body": "div.main.kpsychcontent, div.ce-bodytext",
+        "author": "",
+        "date": "",
+    },
+    "rehab.go.jp": {
+        "title": "h1",
+        "body": "article, div#primary.content-primary",
+        "author": "",
+        "date": "",
+    },
+    "autismo.org.es": {
+        "title": "h1.mod_cta_h",
+        "body": "div#main, div.container-general",
+        "author": "",
+        "date": "",
+    },
 }
 
 _simulator = HumanBehaviorSimulator()
@@ -70,6 +131,9 @@ async def collect(
     cursor: URL of last article processed (skip older) or None
     """
     base_url: str = config["base_url"]
+    allowed_paths: list[str] = config.get("allowed_paths", [])
+    excluded_paths: list[str] = config.get("excluded_paths", [])
+    max_crawl_depth: int = config.get("max_crawl_depth", 2)
     client = get_shared_client()
     domain = urlparse(base_url).netloc.lstrip("www.")
 
@@ -94,7 +158,8 @@ async def collect(
         return [], cursor
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    article_urls = _extract_article_links(soup, base_url)
+    logger.debug("html_crawl: max_crawl_depth=%d (single-level crawl, depth limited by max_items)", max_crawl_depth)
+    article_urls = _extract_article_links(soup, base_url, allowed_paths, excluded_paths)
 
     if not article_urls:
         logger.warning("html_crawl: no article links found on %s", base_url)
@@ -135,7 +200,24 @@ async def collect(
     return items, new_cursor
 
 
-def _extract_article_links(soup: BeautifulSoup, base_url: str) -> list[str]:
+def _matches_path_filter(url: str, allowed_paths: list[str], excluded_paths: list[str]) -> bool:
+    """Check if URL path matches allowed patterns and doesn't match excluded patterns."""
+    path = urlparse(url).path
+    # If excluded_paths defined and path matches any, reject
+    if excluded_paths:
+        for pattern in excluded_paths:
+            if fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path.rstrip('/'), pattern):
+                return False
+    # If allowed_paths defined, path must match at least one
+    if allowed_paths:
+        return any(
+            fnmatch.fnmatch(path, p) or fnmatch.fnmatch(path.rstrip('/'), p)
+            for p in allowed_paths
+        )
+    return True  # No filters = allow all
+
+
+def _extract_article_links(soup: BeautifulSoup, base_url: str, allowed_paths: list[str] = None, excluded_paths: list[str] = None) -> list[str]:
     """Find article links on a listing page."""
     base_domain = urlparse(base_url).netloc
 
@@ -153,6 +235,9 @@ def _extract_article_links(soup: BeautifulSoup, base_url: str) -> list[str]:
             path = parsed.path.lower()
             if any(x in path for x in ("/tag/", "/category/", "/author/", "/feed/", "/page/", "#")):
                 continue
+            if allowed_paths or excluded_paths:
+                if not _matches_path_filter(full_url, allowed_paths or [], excluded_paths or []):
+                    continue
             if full_url not in candidates:
                 candidates.append(full_url)
 
@@ -215,7 +300,7 @@ def _from_jsonld(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem | 
                 source="html_crawl",
                 external_id=None,
                 description=_clean_text(description),
-                content_body=None,
+                content_body=_extract_body(soup),
                 author=author,
                 authors_json=None,
                 published_at=published_at,
@@ -254,7 +339,7 @@ def _from_opengraph(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem
         source="html_crawl",
         external_id=None,
         description=_clean_text(description),
-        content_body=None,
+        content_body=_extract_body(soup),
         author=author,
         authors_json=None,
         published_at=published_at,
@@ -292,7 +377,7 @@ def _from_css_selectors(soup: BeautifulSoup, url: str, domain: str) -> Collected
         source="html_crawl",
         external_id=None,
         description=_clean_text(sel(selectors.get("body", ""))),
-        content_body=None,
+        content_body=_extract_body(soup),
         author=sel(selectors.get("author", "")),
         authors_json=None,
         published_at=sel(selectors.get("date", "")),
