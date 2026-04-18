@@ -14,7 +14,7 @@ from sqlalchemy import select, update
 
 from src.embedder import MODEL_NAME, embed_texts
 from src.storage.db import AsyncSessionLocal
-from src.storage.models import CrawledItem
+from src.storage.models import Chunk, CrawledItem
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +79,58 @@ async def run_loop() -> None:
             count = await run_once()
             if count:
                 logger.info("Embedding run complete: %d items embedded", count)
+            chunk_count = await run_once_chunks()
+            if chunk_count:
+                logger.info("Chunk embedding run complete: %d chunks embedded", chunk_count)
         except Exception as exc:
             logger.error("Embedding loop error: %s", exc)
         await asyncio.sleep(_INTERVAL_SEC)
+
+
+async def run_once_chunks(max_items: int = _MAX_PER_RUN) -> int:
+    """Generate embeddings for chunks missing them. Returns count embedded."""
+    total_embedded = 0
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(Chunk.id, Chunk.chunk_text)
+            .where(Chunk.embedding.is_(None))
+            .order_by(Chunk.id.desc())
+            .limit(max_items)
+        )
+        rows = result.fetchall()
+
+    if not rows:
+        return 0
+
+    for batch_start in range(0, len(rows), _BATCH_SIZE):
+        batch = rows[batch_start : batch_start + _BATCH_SIZE]
+        ids = [r.id for r in batch]
+        texts = [r.chunk_text[:2000] for r in batch]
+
+        try:
+            vectors = await asyncio.to_thread(embed_texts, texts)
+        except Exception as exc:
+            logger.error("Chunk embedding failed: %s", exc)
+            break
+
+        async with AsyncSessionLocal() as session:
+            for row_id, vector in zip(ids, vectors):
+                await session.execute(
+                    update(Chunk)
+                    .where(Chunk.id == row_id)
+                    .values(
+                        embedding=vector,
+                        embedding_model=MODEL_NAME,
+                        embedded_at=datetime.now(tz=timezone.utc),
+                    )
+                )
+            await session.commit()
+
+        total_embedded += len(batch)
+        logger.info("Embedded %d chunks (total this run: %d)", len(batch), total_embedded)
+
+    return total_embedded
 
 
 def _embed_text(title: str, description: str | None) -> str:

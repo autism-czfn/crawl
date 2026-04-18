@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import fnmatch
 import re
 from urllib.parse import urljoin, urlparse
 
@@ -34,6 +35,41 @@ from bs4 import BeautifulSoup
 from src.collectors.base import CollectedItem
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_body(soup: BeautifulSoup) -> str | None:
+    """Extract main article body text, stripping nav/footer/sidebar."""
+    # Work on a copy to avoid mutating the original
+    work = BeautifulSoup(str(soup), "html.parser")
+    for tag in work.find_all(["nav", "footer", "aside", "header", "script", "style", "noscript"]):
+        tag.decompose()
+
+    # Try common article body selectors in priority order
+    selectors = [
+        "article",
+        "[role='main']",
+        "main",
+        ".entry-content",
+        ".post-content",
+        ".article-body",
+        ".content-body",
+        "#content",
+        "#main-content",
+    ]
+    for sel in selectors:
+        el = work.select_one(sel)
+        if el:
+            text = el.get_text(" ", strip=True)
+            if len(text) > 100:  # meaningful content
+                return _clean_text(text)
+
+    # Fallback: get body text
+    body = work.find("body")
+    if body:
+        text = body.get_text(" ", strip=True)
+        if len(text) > 100:
+            return _clean_text(text)
+    return None
 
 # Maximum pages to visit per run (safety cap)
 _MAX_PAGES = 50
@@ -70,6 +106,9 @@ async def collect(
     follow_links: bool = config.get("follow_links", True)
     link_selector: str = config.get("link_selector", "a[href]")
     same_domain_only: bool = config.get("same_domain_only", True)
+    allowed_paths: list[str] = config.get("allowed_paths", [])
+    excluded_paths: list[str] = config.get("excluded_paths", [])
+    max_crawl_depth: int = config.get("max_crawl_depth", 2)
 
     try:
         from playwright.async_api import async_playwright
@@ -114,7 +153,7 @@ async def collect(
                 return items, new_cursor or cursor
 
             # --- Discover and follow links ---
-            link_urls = _extract_links(soup, start_url, link_selector, same_domain_only)
+            link_urls = _extract_links(soup, start_url, link_selector, same_domain_only, allowed_paths, excluded_paths)
 
             # Skip already-processed URLs
             if cursor and cursor in link_urls:
@@ -189,11 +228,30 @@ async def _fetch_page(
         await page.close()
 
 
+def _matches_path_filter(url: str, allowed_paths: list[str], excluded_paths: list[str]) -> bool:
+    """Check if URL path matches allowed patterns and doesn't match excluded patterns."""
+    path = urlparse(url).path
+    # If excluded_paths defined and path matches any, reject
+    if excluded_paths:
+        for pattern in excluded_paths:
+            if fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path.rstrip('/'), pattern):
+                return False
+    # If allowed_paths defined, path must match at least one
+    if allowed_paths:
+        return any(
+            fnmatch.fnmatch(path, p) or fnmatch.fnmatch(path.rstrip('/'), p)
+            for p in allowed_paths
+        )
+    return True  # No filters = allow all
+
+
 def _extract_links(
     soup: BeautifulSoup,
     base_url: str,
     link_selector: str,
     same_domain_only: bool,
+    allowed_paths: list[str] = None,
+    excluded_paths: list[str] = None,
 ) -> list[str]:
     """Find unique links on the page matching the selector."""
     base_domain = urlparse(base_url).netloc
@@ -214,6 +272,10 @@ def _extract_links(
         path = parsed.path.lower()
         if any(x in path for x in ("/tag/", "/category/", "/author/", "/feed/", "/page/", "/login", "/register")):
             continue
+
+        if allowed_paths or excluded_paths:
+            if not _matches_path_filter(full_url, allowed_paths or [], excluded_paths or []):
+                continue
 
         # Must have a meaningful path
         if len(parsed.path) <= 1:
@@ -263,7 +325,7 @@ def _extract_item(
                 source="playwright_crawl",
                 external_id=None,
                 description=_get_meta_description(soup),
-                content_body=None,
+                content_body=_extract_body(soup),
                 author=None,
                 authors_json=None,
                 published_at=None,
@@ -310,7 +372,7 @@ def _from_jsonld(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem | 
                 source="playwright_crawl",
                 external_id=None,
                 description=_clean_text(description),
-                content_body=None,
+                content_body=_extract_body(soup),
                 author=author,
                 authors_json=None,
                 published_at=published_at,
@@ -349,7 +411,7 @@ def _from_opengraph(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem
         source="playwright_crawl",
         external_id=None,
         description=_clean_text(description),
-        content_body=None,
+        content_body=_extract_body(soup),
         author=author,
         authors_json=None,
         published_at=published_at,
@@ -387,7 +449,7 @@ def _from_css_selectors(soup: BeautifulSoup, url: str, domain: str) -> Collected
         source="playwright_crawl",
         external_id=None,
         description=_clean_text(sel(selectors.get("body", ""))),
-        content_body=None,
+        content_body=_extract_body(soup),
         author=sel(selectors.get("author", "")),
         authors_json=None,
         published_at=sel(selectors.get("date", "")),

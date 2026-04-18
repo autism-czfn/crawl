@@ -34,6 +34,9 @@ _COLLECTOR_MAP: dict[str, str] = {
     "newsapi": "src.collectors.newsapi",
     "html_crawl": "src.collectors.html_crawl",
     "playwright_crawl": "src.collectors.playwright_crawl",
+    "sitemap": "src.collectors.sitemap",
+    "nhs_api": "src.collectors.nhs",
+    "cdc_data": "src.collectors.cdc_data",
 }
 
 _SURFACES_JSON = Path(__file__).parent.parent / "config" / "surfaces.json"
@@ -71,6 +74,12 @@ class Scheduler:
                         poll_interval_sec=s.get("poll_interval_sec", 3600),
                         max_items_per_run=s.get("max_items", 30),
                         config_json=s.get("config", {}),
+                        authority_tier=s.get("authority_tier"),
+                        source_type=s.get("source_type"),
+                        audience_type=s.get("audience_type"),
+                        language=s.get("language", "en"),
+                        country=s.get("country"),
+                        organization_name=s.get("organization_name"),
                     )
                     session.add(surface)
                     logger.info("Seeded surface: %s", s["key"])
@@ -87,7 +96,7 @@ class Scheduler:
         now = datetime.now(tz=timezone.utc)
         tasks = []
         for surface in surfaces:
-            if _is_due(surface, now):
+            if surface.force_recrawl or _is_due(surface, now):
                 tasks.append(asyncio.create_task(self._run_surface(surface.key)))
 
         if tasks:
@@ -106,7 +115,7 @@ class Scheduler:
                 return
 
             config = surface.config_json or {}
-            cursor = surface.last_cursor
+            cursor = None if surface.force_recrawl else surface.last_cursor
             limit = surface.max_items_per_run
 
             try:
@@ -124,6 +133,7 @@ class Scheduler:
                         last_error=None,
                         last_run_count=count,
                         consecutive_fails=0,
+                        force_recrawl=False,
                     )
                 )
                 await session.commit()
