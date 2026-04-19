@@ -9,10 +9,10 @@ from .models import CrawledItem, HttpCache, Surface
 @admin.register(Surface)
 class SurfaceAdmin(admin.ModelAdmin):
     list_display  = [
-        "key", "platform", "enabled_badge", "last_status_badge",
+        "key", "platform", "enabled_badge", "force_recrawl", "last_status_badge",
         "last_run_count", "consecutive_fails", "last_run_at", "short_error",
     ]
-    list_filter   = ["platform", "enabled", "last_status"]
+    list_filter   = ["platform", "enabled", "force_recrawl", "last_status"]
     search_fields = ["key", "platform"]
     ordering      = ["-consecutive_fails", "last_status", "key"]
     readonly_fields = [
@@ -21,7 +21,7 @@ class SurfaceAdmin(admin.ModelAdmin):
         "config_json",
     ]
     fields = [
-        "key", "platform", "enabled",
+        "key", "platform", "enabled", "force_recrawl",
         "poll_interval_sec", "max_items_per_run", "config_json",
         "last_run_at", "last_status", "last_error",
         "last_run_count", "consecutive_fails", "last_cursor",

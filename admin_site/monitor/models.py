@@ -21,6 +21,7 @@ class Surface(models.Model):
     last_error        = models.TextField(null=True, blank=True)
     last_run_count    = models.IntegerField(null=True, blank=True)
     consecutive_fails = models.IntegerField(default=0)
+    force_recrawl     = models.BooleanField(default=False)
 
     class Meta:
         managed  = False
