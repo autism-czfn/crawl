@@ -49,7 +49,10 @@ async def run_once(max_items: int = _MAX_PER_RUN) -> int:
             # fastembed is synchronous — run in thread to avoid blocking the event loop
             vectors = await asyncio.to_thread(embed_texts, texts)
         except Exception as exc:
-            logger.error("Embedding failed: %s", exc)
+            logger.warning(
+                "Embedding failed for batch of %d items; will retry next run: %s",
+                len(batch), exc,
+            )
             break
 
         async with AsyncSessionLocal() as session:
@@ -111,7 +114,10 @@ async def run_once_chunks(max_items: int = _MAX_PER_RUN) -> int:
         try:
             vectors = await asyncio.to_thread(embed_texts, texts)
         except Exception as exc:
-            logger.error("Chunk embedding failed: %s", exc)
+            logger.warning(
+                "Chunk embedding failed for batch of %d chunks; will retry next run: %s",
+                len(batch), exc,
+            )
             break
 
         async with AsyncSessionLocal() as session:

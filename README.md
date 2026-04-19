@@ -71,10 +71,12 @@ config/surfaces.json（68 个数据源，含信任等级元数据 + 多语言支
 
 | 等级 | 数量 | 代表来源 |
 |------|------|----------|
-| Tier 1（官方/政府） | 17 | CDC、NIH/NIMH、NHS、NICE、AAP、FDA、各国卫生部、CDC Data API |
-| Tier 2（学术/医院） | 18 | PubMed、Mayo Clinic、Europe PMC、Semantic Scholar、ClinicalTrials |
-| Tier 3（非营利/参考） | 16 | Autism Society、Wikipedia、Spectrum News、ASAN |
+| Tier 1（官方/政府） | 17 | CDC、NIH/NIMH、NHS、NICE、AAP、FDA、各国卫生部、CDC Data API、法国 HAS、日本 NITE |
+| Tier 2（学术/医院） | 18 | PubMed、Mayo Clinic、Europe PMC、Semantic Scholar、ClinicalTrials、德国神经精神网络 |
+| Tier 3（非营利/参考） | 16 | Autism Society、Wikipedia、Spectrum News、ASAN、西班牙 Autismo España |
 | 未分级（社区） | 17 | Reddit、YouTube 个人频道、Hacker News |
+
+**多语言支持：** 64 个英语来源 + 法语（`france_has`）、德语（`germany_neuro`）、日语（`japan_ddis`）、西班牙语（`spain_autismo`）各 1 个
 
 ---
 
@@ -86,6 +88,9 @@ config/surfaces.json（68 个数据源，含信任等级元数据 + 多语言支
 - 每次运行后更新 `last_run_at`、`last_status`、`last_error`、`consecutive_fails`
 - 支持 `force_recrawl` 标志，强制重新采集（忽略游标和间隔）
 - 支持 22 种平台（通过 `_COLLECTOR_MAP` 映射采集器模块）
+- **Playwright 并发限流**：最多同时运行 **2 个** Playwright 浏览器实例（`_PLAYWRIGHT_CONCURRENCY = 2`），防止高并发时内存溢出
+- **Tier-1 来源健康监控**：每 **1 小时**自动扫描所有 Tier-1（官方/政府）数据源；若某来源从未产出内容或 **7 天**内无新条目，自动记录警告日志（`_STALENESS_DAYS = 7`）
+- **启动时元数据同步**：启动时自动将 `surfaces.json` 中的信任元数据（`authority_tier`、`source_type`、`audience_type`、`language`、`country`、`organization_name`）写入数据库 Surface 记录
 
 ---
 
@@ -167,10 +172,11 @@ async def collect(config, cursor, limit) -> tuple[list[CollectedItem], next_curs
 
 ### 6. 向量化循环（`src/embeddings.py`）
 
-- 每 **15 分钟**运行一次，处理尚未向量化的条目（每批最多 500 条）
-- 将 `title + description[:500]` 拼接后调用 **fastembed** 本地模型
-- 模型：`nomic-ai/nomic-embed-text-v1.5`（768 维，无需 API Key）
-- 生成的向量存入 `crawled_items.embedding`（pgvector 类型）
+- 每 **15 分钟**运行一次，每批最多 **500 条**，分两阶段执行：
+  1. **条目向量化**：将 `title + description[:500]` 拼接后生成向量，存入 `crawled_items.embedding`
+  2. **分块向量化**（新增）：对 `chunks` 表中尚未向量化的分块，取 `chunk_text[:2000]` 生成向量，存入 `chunks.embedding`
+- 模型：`nomic-ai/nomic-embed-text-v1.5`（768 维，无需 API Key，fastembed 本地推理）
+- 嵌入失败时以 `WARNING` 级别记录（含批次大小信息），下次循环自动重试
 
 ---
 
@@ -219,6 +225,18 @@ async def collect(config, cursor, limit) -> tuple[list[CollectedItem], next_curs
 
 存储 ETag / Last-Modified，支持条件请求，减少重复流量。
 
+### `crawl_health_metrics`（视图，新增）
+
+数据库视图，按信任等级聚合采集健康指标，用于运维监控与 `/api/stats` 接口。
+
+| 字段 | 说明 |
+|------|------|
+| `authority_tier` | 信任等级（1 / 2 / 3 / null） |
+| `source_count` | 该等级条目总数 |
+| `last_item_at` | 最近入库时间 |
+| `items_last_7d` | 最近 7 天新增条目数 |
+| `staleness_flag` | 布尔值：该等级是否 7 天无新内容 |
+
 ---
 
 ## 快速启动
@@ -254,7 +272,7 @@ bash setup.sh
 
 后台运行于 **http://localhost:8001/admin/**，提供：
 
-- **Surface 监控**：各数据源的运行状态、信任等级、最近错误、连续失败次数，可直接启停
+- **Surface 监控**：各数据源的运行状态、信任等级、最近错误、连续失败次数，可直接启停；列表页直接展示并可编辑 `force_recrawl` 标志，支持按该字段快速筛选
 - **内容浏览**：按来源/平台/信任等级筛选已采集内容，支持标题、DOI、作者搜索
 - **HTTP 缓存**：查看缓存状态
 

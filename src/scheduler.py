@@ -4,14 +4,14 @@ import importlib
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 
 from src.pipeline import save_items
 from src.storage.db import AsyncSessionLocal
-from src.storage.models import Surface
+from src.storage.models import CrawledItem, Surface
 
 logger = logging.getLogger(__name__)
 
@@ -40,19 +40,38 @@ _COLLECTOR_MAP: dict[str, str] = {
 }
 
 _SURFACES_JSON = Path(__file__).parent.parent / "config" / "surfaces.json"
+_TICK_INTERVAL_SEC = 60            # scheduler main loop sleep
+_STALENESS_DAYS = 7                # warn if Tier-1 surface has no new items this many days
+_STALENESS_CHECK_INTERVAL = 3600   # check staleness once per hour
+
+# Playwright launches a full Chromium subprocess (~700 MB–1 GB RSS each).
+# Cap concurrent playwright_crawl runs to prevent OOM when many surfaces are due
+# simultaneously (e.g. first run after a config change, or after 24-hour poll fires).
+_PLAYWRIGHT_CONCURRENCY = 2
+_playwright_semaphore: asyncio.Semaphore | None = None
 
 
 class Scheduler:
     def __init__(self) -> None:
         self._running = True
+        self._tick_count = 0
 
     async def run(self) -> None:
+        global _playwright_semaphore
+        _playwright_semaphore = asyncio.Semaphore(_PLAYWRIGHT_CONCURRENCY)
         await self._seed_surfaces()
         logger.info("Scheduler started")
 
         while self._running:
             await self._tick()
-            await asyncio.sleep(60)  # check every minute
+            self._tick_count += 1
+            # Check Tier-1 staleness once per _STALENESS_CHECK_INTERVAL seconds
+            if self._tick_count % (_STALENESS_CHECK_INTERVAL // _TICK_INTERVAL_SEC) == 0:
+                try:
+                    await self._check_tier1_staleness()
+                except Exception as exc:
+                    logger.error("Tier-1 staleness check failed: %s", exc)
+            await asyncio.sleep(_TICK_INTERVAL_SEC)
 
     async def _seed_surfaces(self) -> None:
         """Load surfaces.json into DB on first run (no-op if already present)."""
@@ -86,7 +105,12 @@ class Scheduler:
             await session.commit()
 
     async def _tick(self) -> None:
-        """Check all enabled surfaces and run those that are due."""
+        """Check all enabled surfaces and run those that are due.
+
+        playwright_crawl surfaces are throttled by _playwright_semaphore
+        (max _PLAYWRIGHT_CONCURRENCY at once) to avoid spawning many Chromium
+        processes simultaneously and exhausting system RAM.
+        """
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(Surface).where(Surface.enabled == True)  # noqa: E712
@@ -97,10 +121,23 @@ class Scheduler:
         tasks = []
         for surface in surfaces:
             if surface.force_recrawl or _is_due(surface, now):
-                tasks.append(asyncio.create_task(self._run_surface(surface.key)))
+                if surface.platform == "playwright_crawl":
+                    tasks.append(asyncio.create_task(
+                        self._run_surface_throttled(surface.key)
+                    ))
+                else:
+                    tasks.append(asyncio.create_task(
+                        self._run_surface(surface.key)
+                    ))
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _run_surface_throttled(self, surface_key: str) -> None:
+        """Wrapper that acquires the playwright semaphore before running."""
+        async with _playwright_semaphore:
+            logger.debug("playwright_semaphore acquired for %s", surface_key)
+            await self._run_surface(surface_key)
 
     async def _run_surface(self, surface_key: str) -> None:
         async with AsyncSessionLocal() as session:
@@ -154,6 +191,52 @@ class Scheduler:
                     )
                 )
                 await session.commit()
+
+
+    async def _check_tier1_staleness(self) -> None:
+        """Warn if any Tier-1 surface has produced no new items in the last 7 days."""
+        threshold = datetime.now(tz=timezone.utc) - timedelta(days=_STALENESS_DAYS)
+
+        async with AsyncSessionLocal() as session:
+            # Get all enabled Tier-1 surfaces
+            result = await session.execute(
+                select(Surface).where(
+                    Surface.enabled == True,  # noqa: E712
+                    Surface.authority_tier == 1,
+                )
+            )
+            tier1_surfaces = result.scalars().all()
+
+        for surface in tier1_surfaces:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(func.max(CrawledItem.collected_at)).where(
+                        CrawledItem.surface_key == surface.key
+                    )
+                )
+                last_collected = result.scalar_one_or_none()
+
+            if last_collected is None:
+                logger.warning(
+                    "Tier-1 surface '%s' (%s) has NEVER produced items — "
+                    "check collector configuration",
+                    surface.key,
+                    surface.organization_name or "unknown org",
+                )
+                continue  # no timestamp to compare; skip staleness check
+            elif last_collected.tzinfo is None:
+                last_collected = last_collected.replace(tzinfo=timezone.utc)
+
+            if last_collected < threshold:
+                days_stale = (datetime.now(tz=timezone.utc) - last_collected).days
+                logger.warning(
+                    "Tier-1 surface '%s' (%s) has not produced new items in %d days "
+                    "(last item: %s) — check collector or re-enable Playwright",
+                    surface.key,
+                    surface.organization_name or "unknown org",
+                    days_stale,
+                    last_collected.date(),
+                )
 
 
 def _is_due(surface: Surface, now: datetime) -> bool:
