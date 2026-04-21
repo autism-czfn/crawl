@@ -1,0 +1,137 @@
+"""Shared URL-quality filter for all web crawlers.
+
+Every link a crawler considers following or storing must pass
+``is_content_url()`` before it is enqueued or written to the DB.
+This prevents nav-bar / footer / shop / account URLs from polluting
+the ``crawled_items`` table.
+
+Rules (applied in order):
+  1. URL must live on exactly ``seed_domain`` (netloc match).
+  2. No path *segment* (split on ``/``) may appear in
+     ``_BLOCKED_SEGMENTS``.  Segment matching avoids false positives
+     from substring checks (e.g. the word "login" inside a legitimate
+     article slug would not be a segment by itself).
+  3. The path must contain at least **two** non-empty segments
+     (rejects bare locale roots like ``/en/`` and domain homepages).
+"""
+
+from __future__ import annotations
+
+from urllib.parse import urlparse
+
+# ---------------------------------------------------------------------------
+# Blocked path segments
+# ---------------------------------------------------------------------------
+# Any URL whose path contains one of these segments (case-insensitive, split
+# on "/") will be rejected.  Add new entries here; both html_crawl and
+# playwright_crawl pick them up automatically.
+_BLOCKED_SEGMENTS: frozenset[str] = frozenset(
+    {
+        # ---- Authentication / user accounts ----
+        "login",
+        "logout",
+        "sign-in",
+        "signin",
+        "sign-out",
+        "signout",
+        "register",
+        "signup",
+        "sign-up",
+        "account",
+        "my-account",
+        "accounts",
+        "profile",
+        "dashboard",
+        "password",
+        "forgot-password",
+        "reset-password",
+        # ---- Shopping / e-commerce ----
+        "cart",
+        "checkout",
+        "shop",
+        "shopaap",  # AAP-specific shop subdirectory
+        "store",
+        "buy",
+        "order",
+        "orders",
+        "purchase",
+        # ---- Fundraising / membership ----
+        "donate",
+        "donation",
+        "donations",
+        "ways-to-give",
+        "giving",
+        "membership",
+        "subscribe",
+        "subscription",
+        # ---- Employment ----
+        "careers",
+        "jobs",
+        "employment",
+        # ---- Navigation / taxonomy helpers ----
+        "tag",
+        "tags",
+        "category",
+        "categories",
+        "author",
+        "authors",
+        "feed",
+        "feeds",
+        # ---- Utility / infra ----
+        "search",
+        "sitemap",
+        "cdn-cgi",
+        "wp-login",
+        "wp-admin",
+        # ---- Legal / policy pages ----
+        "privacy",
+        "terms",
+        "terms-of-use",
+        "terms-of-service",
+        "disclaimer",
+        "ad-disclaimer",
+        "legal",
+        "cookies",
+        "cookie-policy",
+    }
+)
+
+
+def is_content_url(url: str, seed_domain: str) -> bool:
+    """Return ``True`` only when *url* looks like a real content page.
+
+    Parameters
+    ----------
+    url:
+        Absolute URL to evaluate.
+    seed_domain:
+        The ``netloc`` of the crawler's seed page (e.g. ``"www.aap.org"``).
+        The URL must live on this exact domain.
+
+    Returns
+    -------
+    bool
+        ``True`` → safe to follow/store.
+        ``False`` → discard (nav/footer/utility/account link).
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    # Rule 1 — same domain
+    if parsed.netloc != seed_domain:
+        return False
+
+    # Split path into non-empty lower-cased segments
+    segments = [s.lower() for s in parsed.path.split("/") if s]
+
+    # Rule 2 — no blocked segment
+    if any(seg in _BLOCKED_SEGMENTS for seg in segments):
+        return False
+
+    # Rule 3 — at least two path segments  (rejects "/" and "/en/")
+    if len(segments) < 2:
+        return False
+
+    return True

@@ -18,6 +18,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 from src.collectors.base import CollectedItem
+from src.collectors.url_filter import is_content_url
 from src.http.client import get_shared_client
 from src.http.human import HumanBehaviorSimulator
 
@@ -227,19 +228,18 @@ def _extract_article_links(soup: BeautifulSoup, base_url: str, allowed_paths: li
     for a in soup.find_all("a", href=True):
         href: str = a["href"]
         full_url = urljoin(base_url, href)
-        parsed = urlparse(full_url)
 
-        # Only same-domain links with meaningful paths
-        if parsed.netloc == base_domain and len(parsed.path) > 1:
-            # Exclude obvious non-article paths
-            path = parsed.path.lower()
-            if any(x in path for x in ("/tag/", "/category/", "/author/", "/feed/", "/page/", "#")):
+        # Enforce same-domain, blocked-segment, and minimum-depth rules.
+        # is_content_url() supersedes the old inline substring checks.
+        if not is_content_url(full_url, base_domain):
+            continue
+
+        if allowed_paths or excluded_paths:
+            if not _matches_path_filter(full_url, allowed_paths or [], excluded_paths or []):
                 continue
-            if allowed_paths or excluded_paths:
-                if not _matches_path_filter(full_url, allowed_paths or [], excluded_paths or []):
-                    continue
-            if full_url not in candidates:
-                candidates.append(full_url)
+
+        if full_url not in candidates:
+            candidates.append(full_url)
 
     return candidates
 

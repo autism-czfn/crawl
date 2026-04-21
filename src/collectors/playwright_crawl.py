@@ -33,6 +33,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 from src.collectors.base import CollectedItem
+from src.collectors.url_filter import is_content_url
 
 logger = logging.getLogger(__name__)
 
@@ -265,21 +266,17 @@ def _extract_links(
         full_url = urljoin(base_url, href)
         parsed = urlparse(full_url)
 
-        if same_domain_only and parsed.netloc != base_domain:
-            continue
-
-        # Skip non-content paths
-        path = parsed.path.lower()
-        if any(x in path for x in ("/tag/", "/category/", "/author/", "/feed/", "/page/", "/login", "/register")):
+        # Enforce same-domain (when requested), blocked-segment, and
+        # minimum-depth rules via the shared content-URL filter.
+        # When same_domain_only is False we still reject non-content
+        # segments on the target domain itself.
+        check_domain = base_domain if same_domain_only else parsed.netloc
+        if not is_content_url(full_url, check_domain):
             continue
 
         if allowed_paths or excluded_paths:
             if not _matches_path_filter(full_url, allowed_paths or [], excluded_paths or []):
                 continue
-
-        # Must have a meaningful path
-        if len(parsed.path) <= 1:
-            continue
 
         # Normalize: strip fragments and trailing slashes for dedup
         clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
