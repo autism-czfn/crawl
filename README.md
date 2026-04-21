@@ -115,13 +115,18 @@ async def collect(config, cursor, limit) -> tuple[list[CollectedItem], next_curs
 | 社区 | Reddit（多个子版块）、Hacker News |
 | 媒体 | RSS 订阅源、NewsAPI、YouTube |
 | 百科 | Wikipedia |
-| 网页爬取 | HTML 爬虫、Playwright 爬虫（Cloudflare 绕过） |
+| 网页爬取 | HTML 爬虫、Playwright 爬虫（Cloudflare 绕过）、URL 质量过滤器（`url_filter.py`，新增）|
 | Sitemap | 通用 Sitemap XML 采集器（Mayo Clinic 等） |
 
 **HTML / Playwright 爬虫特性：**
 
 - 内容提取优先级：JSON-LD → Open Graph → 每站 CSS 选择器
 - **正文提取**（`_extract_body`）：自动去除导航/页脚/侧栏，提取主体文本
+- **URL 质量过滤**（`src/collectors/url_filter.py`，新增）：集中式 URL 内容判断模块，所有爬虫在入队或存库前均调用 `is_content_url()` 进行校验，三条规则依次执行：
+  1. 必须与种子域名完全一致（`netloc` 匹配）
+  2. 路径中任意段（按 `/` 分割）不得出现于 `_BLOCKED_SEGMENTS` 黑名单（涵盖登录/注册、购物/结算、捐赠/会员、招聘、Tag/Category 导航、站点地图、法律政策等 50+ 条目），采用段级匹配避免字符串误判
+  3. 路径至少包含 **2 个**非空段（排除 `/` 首页及 `/en/` 等裸语言根路径）
+  - `html_crawl.py` 和 `playwright_crawl.py` 均已移除各自内联的 `any(x in path for x in ...)` 检查，统一委托给 `is_content_url()`
 - **路径过滤**：`allowed_paths` / `excluded_paths` 配置项，使用 `fnmatch` 模式匹配
 - **爬取深度控制**：`max_crawl_depth` 配置项（默认 2）
 - 人类行为模拟：随机延迟、首页预访问、favicon 预取
