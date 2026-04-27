@@ -4,6 +4,7 @@ from src.config import settings
 from src.captions import run_loop as caption_loop
 from src.chunk_pipeline import run_loop as chunk_loop
 from src.embeddings import run_loop as embedding_loop
+from src.pipeline import enrich_fulltext_loop
 from src.scheduler import Scheduler
 
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL, logging.INFO))
@@ -18,6 +19,7 @@ async def main() -> None:
         embedding_loop(),
         chunk_loop(),
         caption_loop(),
+        enrich_fulltext_loop(),
     )
 
 

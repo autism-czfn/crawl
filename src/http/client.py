@@ -93,7 +93,7 @@ DOMAIN_RATE_LIMITS: dict[str, float] = {
     "api.openalex.org": 60,
     "clinicaltrials.gov": 20,
     "api.core.ac.uk": 10,
-    "newsapi.org": 60,
+    "newsapi.org": 0.07,  # free tier: 100 req/day ≈ 0.07 rpm
     "youtube.googleapis.com": 60,
     "wrongplanet.net": 6,
 }

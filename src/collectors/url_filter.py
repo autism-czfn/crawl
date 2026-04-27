@@ -6,6 +6,8 @@ This prevents nav-bar / footer / shop / account URLs from polluting
 the ``crawled_items`` table.
 
 Rules (applied in order):
+  0. URL must have no fragment (``#anchor``) — fragment URLs point to
+     the same page and are never independent content pages.
   1. URL must live on exactly ``seed_domain`` (netloc match).
   2. No path *segment* (split on ``/``) may appear in
      ``_BLOCKED_SEGMENTS``.  Segment matching avoids false positives
@@ -97,7 +99,7 @@ _BLOCKED_SEGMENTS: frozenset[str] = frozenset(
 )
 
 
-def is_content_url(url: str, seed_domain: str) -> bool:
+def is_content_url(url: str, seed_domain: str, min_path_segments: int = 2) -> bool:
     """Return ``True`` only when *url* looks like a real content page.
 
     Parameters
@@ -119,6 +121,12 @@ def is_content_url(url: str, seed_domain: str) -> bool:
     except Exception:
         return False
 
+    # Strip URL fragments (#anchor) — they point to the same page and are
+    # never independent content URLs.  Checking the fragment-stripped URL
+    # also prevents duplicate crawls of the same page via different anchors.
+    if parsed.fragment:
+        return False
+
     # Rule 1 — same domain
     if parsed.netloc != seed_domain:
         return False
@@ -130,8 +138,8 @@ def is_content_url(url: str, seed_domain: str) -> bool:
     if any(seg in _BLOCKED_SEGMENTS for seg in segments):
         return False
 
-    # Rule 3 — at least two path segments  (rejects "/" and "/en/")
-    if len(segments) < 2:
+    # Rule 3 — minimum path segments (default 2, configurable per surface)
+    if len(segments) < min_path_segments:
         return False
 
     return True

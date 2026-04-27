@@ -29,7 +29,7 @@ async def run_once(max_items: int = _MAX_PER_RUN) -> int:
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(CrawledItem.id, CrawledItem.title, CrawledItem.description)
+            select(CrawledItem.id, CrawledItem.title, CrawledItem.description, CrawledItem.content_body)
             .where(CrawledItem.embedding.is_(None))
             .order_by(CrawledItem.collected_at.desc())
             .limit(max_items)
@@ -43,7 +43,7 @@ async def run_once(max_items: int = _MAX_PER_RUN) -> int:
     for batch_start in range(0, len(rows), _BATCH_SIZE):
         batch = rows[batch_start : batch_start + _BATCH_SIZE]
         ids = [r.id for r in batch]
-        texts = [_embed_text(r.title, r.description) for r in batch]
+        texts = [_embed_text(r.title, r.description, r.content_body) for r in batch]
 
         try:
             # fastembed is synchronous — run in thread to avoid blocking the event loop
@@ -139,8 +139,11 @@ async def run_once_chunks(max_items: int = _MAX_PER_RUN) -> int:
     return total_embedded
 
 
-def _embed_text(title: str, description: str | None) -> str:
+def _embed_text(title: str, description: str | None, content_body: str | None = None) -> str:
+    """Compose text for embedding. Prefers content_body over description."""
     parts = [title.strip()]
-    if description:
+    if content_body:
+        parts.append(content_body[:800].strip())
+    elif description:
         parts.append(description[:500].strip())
     return " ".join(parts)

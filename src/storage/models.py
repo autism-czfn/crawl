@@ -41,6 +41,8 @@ class CrawledItem(Base):
     embedding = Column(Vector(768), nullable=True)
     embedding_model = Column(Text, nullable=True)
     embedded_at = Column(DateTime(timezone=True), nullable=True)
+    oa_url = Column(Text, nullable=True)
+    last_harvested_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("url", name="uq_crawled_items_url"),
@@ -89,6 +91,7 @@ class Surface(Base):
     last_error = Column(Text, nullable=True)
     last_run_count = Column(Integer, nullable=True)
     consecutive_fails = Column(Integer, nullable=False, default=0)
+    overrides_json = Column(JSONB, nullable=True)
 
 
 class HttpCache(Base):

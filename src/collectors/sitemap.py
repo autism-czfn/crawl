@@ -24,6 +24,7 @@ from xml.etree import ElementTree
 from bs4 import BeautifulSoup
 
 from src.collectors.base import CollectedItem
+from src.extractors.html import extract_body as _extract_body
 from src.http.client import get_shared_client
 
 logger = logging.getLogger(__name__)
@@ -215,27 +216,6 @@ def _extract_page(soup: BeautifulSoup, url: str) -> CollectedItem | None:
         engagement={},
         raw_payload={},
     )
-
-
-def _extract_body(soup: BeautifulSoup) -> str | None:
-    """Extract main article body text."""
-    work = BeautifulSoup(str(soup), "html.parser")
-    for tag in work.find_all(["nav", "footer", "aside", "header", "script", "style", "noscript"]):
-        tag.decompose()
-
-    for sel in ["article", "[role='main']", "main", ".content", "#main-content", "#content"]:
-        el = work.select_one(sel)
-        if el:
-            text = el.get_text(" ", strip=True)
-            if len(text) > 100:
-                return _clean_text(text)
-
-    body = work.find("body")
-    if body:
-        text = body.get_text(" ", strip=True)
-        if len(text) > 100:
-            return _clean_text(text)
-    return None
 
 
 def _extract_author(author_data) -> str | None:

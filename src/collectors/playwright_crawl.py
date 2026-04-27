@@ -34,43 +34,9 @@ from bs4 import BeautifulSoup
 
 from src.collectors.base import CollectedItem
 from src.collectors.url_filter import is_content_url
+from src.extractors.html import extract_body as _extract_body
 
 logger = logging.getLogger(__name__)
-
-
-def _extract_body(soup: BeautifulSoup) -> str | None:
-    """Extract main article body text, stripping nav/footer/sidebar."""
-    # Work on a copy to avoid mutating the original
-    work = BeautifulSoup(str(soup), "html.parser")
-    for tag in work.find_all(["nav", "footer", "aside", "header", "script", "style", "noscript"]):
-        tag.decompose()
-
-    # Try common article body selectors in priority order
-    selectors = [
-        "article",
-        "[role='main']",
-        "main",
-        ".entry-content",
-        ".post-content",
-        ".article-body",
-        ".content-body",
-        "#content",
-        "#main-content",
-    ]
-    for sel in selectors:
-        el = work.select_one(sel)
-        if el:
-            text = el.get_text(" ", strip=True)
-            if len(text) > 100:  # meaningful content
-                return _clean_text(text)
-
-    # Fallback: get body text
-    body = work.find("body")
-    if body:
-        text = body.get_text(" ", strip=True)
-        if len(text) > 100:
-            return _clean_text(text)
-    return None
 
 # Maximum pages to visit per run (safety cap)
 _MAX_PAGES = 50

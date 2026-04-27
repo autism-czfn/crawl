@@ -39,6 +39,7 @@ async def collect(
         encoded = title.replace(" ", "_")
         url = f"https://en.wikipedia.org/wiki/{encoded}"
 
+        # Fetch summary for metadata (title, pageid, timestamp)
         try:
             resp = await client.get(_SUMMARY_API.format(title=encoded))
             data = resp.json()
@@ -52,12 +53,34 @@ async def collect(
 
         summary_title = data.get("title", title).strip()
         description = data.get("extract", "").strip() or None
-        thumbnail = data.get("thumbnail", {}).get("source")
         last_modified = data.get("timestamp")
 
         published_at: str | None = None
         if last_modified:
             published_at = last_modified  # already ISO8601
+
+        # Fetch full article text via MediaWiki Action API
+        content_body: str | None = None
+        try:
+            wiki_resp = await client.get(
+                _WIKI_API,
+                params={
+                    "action": "query",
+                    "prop": "extracts",
+                    "explaintext": "1",
+                    "titles": title,
+                    "format": "json",
+                },
+            )
+            wiki_data = wiki_resp.json()
+            pages = wiki_data.get("query", {}).get("pages", {})
+            for page in pages.values():
+                raw_extract = page.get("extract", "")
+                if raw_extract and len(raw_extract) > 300:
+                    content_body = raw_extract[:50_000]  # cap at 50K chars
+                    break
+        except Exception as exc:
+            logger.debug("Wikipedia full-article fetch failed for '%s': %s", title, exc)
 
         items.append(
             CollectedItem(
@@ -66,7 +89,7 @@ async def collect(
                 source="wikipedia",
                 external_id=str(data.get("pageid", "")),
                 description=description,
-                content_body=None,
+                content_body=content_body,
                 author=None,
                 authors_json=None,
                 published_at=published_at,

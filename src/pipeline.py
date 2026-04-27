@@ -6,12 +6,13 @@ import logging
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.collectors.base import CollectedItem, normalize_title
+from src.storage.db import AsyncSessionLocal
 from src.storage.models import CrawledItem, Surface
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,32 @@ async def save_items(
         logger.error("pipeline commit failed: %s", exc)
         return 0
 
+    # P3-C: Re-embedding trigger — null out embeddings for records where content changed
+    urls_with_content = [
+        (item.get("url") or "").strip()
+        for item in items
+        if item.get("content_body") and (item.get("url") or "").strip()
+    ]
+    if urls_with_content:
+        try:
+            await session.execute(
+                text("""
+                    UPDATE crawled_items
+                    SET embedding = NULL,
+                        embedded_at = NULL
+                    WHERE url = ANY(:urls)
+                      AND embedded_at IS NOT NULL
+                      AND content_hash IS NOT NULL
+                      AND content_hash != encode(
+                            sha256(content_body::bytea), 'hex'
+                          )
+                """),
+                {"urls": urls_with_content},
+            )
+            await session.commit()
+        except Exception as exc:
+            logger.debug("P3-C re-embedding trigger failed (non-critical): %s", exc)
+
     return inserted
 
 
@@ -122,27 +149,35 @@ def _hash_content(content: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 async def enrich_unpaywall(session: AsyncSession, batch_size: int = 50) -> int:
-    """Fetch open-access URLs from Unpaywall for records with DOI but no content_body."""
+    """Fetch open-access URLs from Unpaywall for records with DOI.
+
+    Also backfills oa_url for existing open_access=True records that
+    have no oa_url set (records collected before migration 0004).
+    """
     from src.config import settings
     from src.http.client import get_shared_client
 
     client = get_shared_client()
     updated = 0
 
-    # Find records with DOI but no content_body
+    # Find records with DOI that need Unpaywall enrichment:
+    # - records not yet checked (open_access IS NULL), OR
+    # - records already marked OA but missing oa_url (pre-migration backfill)
     result = await session.execute(
         select(CrawledItem.id, CrawledItem.doi)
         .where(CrawledItem.doi.isnot(None))
-        .where(CrawledItem.content_body.is_(None))
-        .where(CrawledItem.open_access.isnot(True))
+        .where(
+            (CrawledItem.open_access.is_(None)) |
+            (CrawledItem.open_access.is_(True) & CrawledItem.oa_url.is_(None))
+        )
         .limit(batch_size)
     )
     rows = result.fetchall()
 
     for row_id, doi in rows:
-        url = f"https://api.unpaywall.org/v2/{doi}?email={settings.CRAWLER_EMAIL}"
+        api_url = f"https://api.unpaywall.org/v2/{doi}?email={settings.CRAWLER_EMAIL}"
         try:
-            resp = await client.get(url)
+            resp = await client.get(api_url)
             data = resp.json()
         except Exception as exc:
             logger.debug("Unpaywall failed for doi=%s: %s", doi, exc)
@@ -156,9 +191,110 @@ async def enrich_unpaywall(session: AsyncSession, batch_size: int = 50) -> int:
             await session.execute(
                 update(CrawledItem)
                 .where(CrawledItem.id == row_id)
-                .values(open_access=is_oa)
+                .values(open_access=is_oa, oa_url=oa_url)  # persist oa_url
             )
             updated += 1
 
     await session.commit()
     return updated
+
+
+async def enrich_fulltext(session: AsyncSession, batch_size: int = 20) -> int:
+    """Fetch full text for open-access records that have an oa_url.
+
+    Phase 1: HTML URLs only. PDF URLs are deferred (logged + skipped) until
+    P3-A PDF extractor is available.
+    """
+    from src.http.client import get_shared_client
+    from src.extractors.html import extract_body
+    from bs4 import BeautifulSoup
+
+    client = get_shared_client()
+    enriched = 0
+
+    result = await session.execute(
+        select(CrawledItem.id, CrawledItem.oa_url)
+        .where(CrawledItem.open_access.is_(True))
+        .where(CrawledItem.content_body.is_(None))
+        .where(CrawledItem.doi.isnot(None))
+        .where(CrawledItem.oa_url.isnot(None))
+        .limit(batch_size)
+    )
+    rows = result.fetchall()
+
+    for row_id, oa_url in rows:
+        # PDF detection
+        is_pdf = (
+            oa_url.lower().endswith(".pdf") or
+            "pdf" in oa_url.lower()
+        )
+        if is_pdf:
+            try:
+                from src.extractors.pdf import extract_text_from_pdf
+                resp = await client.get(oa_url)
+                if "application/pdf" in resp.headers.get("content-type", ""):
+                    extracted = extract_text_from_pdf(resp.content)
+                    if extracted is not None:  # '' = permanent failure sentinel, also stored
+                        await session.execute(
+                            update(CrawledItem)
+                            .where(CrawledItem.id == row_id)
+                            .values(content_body=extracted)  # store '' to mark permanent failure
+                        )
+                        enriched += 1
+                    continue
+                # Fall through to HTML extraction if content-type not PDF
+            except ImportError:
+                logger.info("enrich_fulltext: PDF oa_url deferred (pdfplumber not installed): %s", oa_url)
+                continue
+            except Exception as exc:
+                logger.debug("enrich_fulltext: PDF fetch failed for %s: %s", oa_url, exc)
+                continue
+
+        # HTML fetch
+        try:
+            resp = await client.get(oa_url, use_browser_ua=True)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            body = extract_body(soup)
+
+            # Quality gate for paywall masquerading as OA
+            if body is None:
+                logger.debug("enrich_fulltext: empty/low-quality body at %s", oa_url)
+                continue
+
+            paywall_signals = [
+                "sign in", "log in", "create account", "access denied", "subscribe to read"
+            ]
+            body_lower = body.lower()
+            if len(body) < 300 or any(s in body_lower for s in paywall_signals):
+                logger.debug("enrich_fulltext: paywall detected at %s — discarding", oa_url)
+                continue
+
+            await session.execute(
+                update(CrawledItem)
+                .where(CrawledItem.id == row_id)
+                .values(content_body=body)
+            )
+            enriched += 1
+
+        except Exception as exc:
+            logger.debug("enrich_fulltext: fetch failed for %s: %s", oa_url, exc)
+            continue
+
+    await session.commit()
+    return enriched
+
+
+async def enrich_fulltext_loop() -> None:
+    """Long-running loop: enriches OA records with full text every 6 hours."""
+    import asyncio as _asyncio
+    _interval = 6 * 3600
+    logger.info("enrich_fulltext loop started (interval=%ds)", _interval)
+    while True:
+        try:
+            async with AsyncSessionLocal() as session:
+                count = await enrich_fulltext(session)
+                if count:
+                    logger.info("enrich_fulltext: enriched %d records", count)
+        except Exception as exc:
+            logger.error("enrich_fulltext loop error: %s", exc)
+        await _asyncio.sleep(_interval)

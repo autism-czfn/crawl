@@ -109,4 +109,20 @@ async def collect(
             )
         )
 
+    # Secondary pass: fetch full article body for each item
+    from src.extractors.html import extract_body
+    for item in items:
+        url = item.get("url", "")
+        if not url:
+            continue
+        try:
+            art_resp = await client.get(url, use_browser_ua=True)
+            from bs4 import BeautifulSoup
+            art_soup = BeautifulSoup(art_resp.text, "html.parser")
+            body = extract_body(art_soup)
+            if body:
+                item["content_body"] = body
+        except Exception as exc:
+            logger.debug("RSS article body fetch failed for %s: %s", url, exc)
+
     return items, new_cursor or cursor

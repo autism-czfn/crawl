@@ -37,6 +37,8 @@ _COLLECTOR_MAP: dict[str, str] = {
     "sitemap": "src.collectors.sitemap",
     "nhs_api": "src.collectors.nhs",
     "cdc_data": "src.collectors.cdc_data",
+    "link_harvester": "src.collectors.link_harvester",
+    "link_harvester_backfill": "src.collectors.link_harvester_backfill",
 }
 
 _SURFACES_JSON = Path(__file__).parent.parent / "config" / "surfaces.json"
@@ -102,6 +104,31 @@ class Scheduler:
                     )
                     session.add(surface)
                     logger.info("Seeded surface: %s", s["key"])
+                else:
+                    # Upsert config fields from surfaces.json.
+                    # Preserve runtime-only fields: last_run_at, last_cursor,
+                    # consecutive_fails, force_recrawl, overrides_json.
+                    file_config = s.get("config", {})
+                    # DB overrides_json wins over file config values
+                    effective_config = {**file_config, **(existing.overrides_json or {})}
+                    await session.execute(
+                        update(Surface)
+                        .where(Surface.key == s["key"])
+                        .values(
+                            platform=s["platform"],
+                            enabled=s.get("enabled", existing.enabled),
+                            poll_interval_sec=s.get("poll_interval_sec", existing.poll_interval_sec),
+                            max_items_per_run=s.get("max_items", existing.max_items_per_run),
+                            config_json=effective_config,
+                            authority_tier=s.get("authority_tier", existing.authority_tier),
+                            source_type=s.get("source_type", existing.source_type),
+                            audience_type=s.get("audience_type", existing.audience_type),
+                            language=s.get("language", existing.language),
+                            country=s.get("country", existing.country),
+                            organization_name=s.get("organization_name", existing.organization_name),
+                        )
+                    )
+                    logger.debug("Updated surface config: %s", s["key"])
             await session.commit()
 
     async def _tick(self) -> None:
