@@ -80,6 +80,11 @@ async def collect(
             else:
                 published_at = f"{pub_date}T00:00:00+00:00" if "T" not in str(pub_date) else str(pub_date)
 
+        # CORE's fullText field sometimes contains only the title (~35 chars).
+        # Require at least 200 characters of actual content before storing.
+        raw_full_text = (r.get("fullText") or "").strip()
+        content_body = raw_full_text if len(raw_full_text) >= 200 else None
+
         items.append(
             CollectedItem(
                 title=title,
@@ -87,7 +92,7 @@ async def collect(
                 source="core",
                 external_id=str(r.get("id", "")),
                 description=r.get("abstract") or None,
-                content_body=r.get("fullText") or None,
+                content_body=content_body,
                 author=authors_json[0]["family"] if authors_json else None,
                 authors_json=authors_json or None,
                 published_at=published_at,

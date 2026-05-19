@@ -17,7 +17,7 @@ from src.storage.models import CrawledItem, Chunk
 
 logger = logging.getLogger(__name__)
 
-_BATCH_SIZE = 50
+_BATCH_SIZE = 200    # increased from 50 to clear backlog faster
 _INTERVAL_SEC = 900  # 15 minutes
 
 

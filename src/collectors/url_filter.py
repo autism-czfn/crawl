@@ -99,7 +99,12 @@ _BLOCKED_SEGMENTS: frozenset[str] = frozenset(
 )
 
 
-def is_content_url(url: str, seed_domain: str, min_path_segments: int = 2) -> bool:
+def is_content_url(
+    url: str,
+    seed_domain: str,
+    min_path_segments: int = 2,
+    child_link_domains: list[str] | None = None,
+) -> bool:
     """Return ``True`` only when *url* looks like a real content page.
 
     Parameters
@@ -108,7 +113,13 @@ def is_content_url(url: str, seed_domain: str, min_path_segments: int = 2) -> bo
         Absolute URL to evaluate.
     seed_domain:
         The ``netloc`` of the crawler's seed page (e.g. ``"www.aap.org"``).
-        The URL must live on this exact domain.
+        The URL must live on this exact domain, unless its domain appears in
+        ``child_link_domains``.
+    child_link_domains:
+        Optional list of extra trusted domains (e.g. ``["pubmed.ncbi.nlm.nih.gov",
+        "doi.org"]``) that are also allowed through Rule 1.  When a URL matches
+        one of these domains the minimum-path-segments rule is relaxed to 1 so
+        that canonical paper URLs (e.g. ``/12345678``) are not filtered out.
 
     Returns
     -------
@@ -127,9 +138,15 @@ def is_content_url(url: str, seed_domain: str, min_path_segments: int = 2) -> bo
     if parsed.fragment:
         return False
 
-    # Rule 1 — same domain
-    if parsed.netloc != seed_domain:
+    # Rule 1 — domain check
+    allowed_domains = {seed_domain} | set(child_link_domains or [])
+    if parsed.netloc not in allowed_domains:
         return False
+
+    # Cross-domain links are academic paper URLs; relax min_path_segments to 1
+    # so short canonical paths like /12345678 or /abs/2301.00001 pass through.
+    if parsed.netloc != seed_domain:
+        min_path_segments = min(min_path_segments, 1)
 
     # Split path into non-empty lower-cased segments
     segments = [s.lower() for s in parsed.path.split("/") if s]

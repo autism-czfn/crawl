@@ -73,8 +73,8 @@ _SITE_SELECTORS: dict[str, dict[str, str]] = {
         "date": "",
     },
     "rehab.go.jp": {
-        "title": "h1",
-        "body": "article, div#primary.content-primary",
+        "title": "title",   # no h1; page title is in <title> tag
+        "body": "main",     # confirmed via manual inspection
         "author": "",
         "date": "",
     },
@@ -114,6 +114,8 @@ async def collect(
     child_link_domains: list[str] = config.get("child_link_domains", [])
     surface_selectors: dict = config.get("selectors", {})
     min_path_segments: int = config.get("min_path_segments", 2)
+    positive_url_patterns: list[str] = config.get("positive_url_patterns", [])
+    negative_url_patterns: list[str] = config.get("negative_url_patterns", [])
     client = get_shared_client()
     domain = urlparse(base_url).netloc.lstrip("www.")
 
@@ -139,7 +141,8 @@ async def collect(
 
     soup = BeautifulSoup(resp.text, "html.parser")
     article_urls = _extract_article_links(
-        soup, base_url, allowed_paths, excluded_paths, min_path_segments
+        soup, base_url, allowed_paths, excluded_paths, min_path_segments,
+        positive_url_patterns, negative_url_patterns,
     )
 
     if not article_urls:
@@ -240,11 +243,35 @@ async def _filter_known_urls(urls: list[str]) -> list[str]:
     return filtered
 
 
-def _extract_article_links(soup: BeautifulSoup, base_url: str, allowed_paths: list[str] = None, excluded_paths: list[str] = None, min_path_segments: int = 2) -> list[str]:
+def _url_score(url: str, positive_patterns: list[str], negative_patterns: list[str]) -> int:
+    """Score a URL for article likelihood. Returns score; follow only if >= 0 (default)
+    or >= 2 when patterns are active (per review heuristic)."""
+    score = 0
+    for p in positive_patterns:
+        if p in url:
+            score += 5
+    for p in negative_patterns:
+        if p in url:
+            score -= 8
+    # Penalise very deep paths (6+ slashes) — usually pagination or params
+    if url.count("/") > 6:
+        score -= 2
+    return score
+
+
+def _extract_article_links(
+    soup: BeautifulSoup,
+    base_url: str,
+    allowed_paths: list[str] | None = None,
+    excluded_paths: list[str] | None = None,
+    min_path_segments: int = 2,
+    positive_url_patterns: list[str] | None = None,
+    negative_url_patterns: list[str] | None = None,
+) -> list[str]:
     """Find article links on a listing page."""
     base_domain = urlparse(base_url).netloc
+    use_scoring = bool(positive_url_patterns or negative_url_patterns)
 
-    # Look for common article link patterns
     candidates: list[str] = []
 
     for a in soup.find_all("a", href=True):
@@ -252,12 +279,24 @@ def _extract_article_links(soup: BeautifulSoup, base_url: str, allowed_paths: li
         full_url = urljoin(base_url, href)
 
         # Enforce same-domain, blocked-segment, and minimum-depth rules.
-        # is_content_url() supersedes the old inline substring checks.
-        if not is_content_url(full_url, base_domain, min_path_segments=min_path_segments):
+        if not is_content_url(full_url, base_domain, min_path_segments=min_path_segments, child_link_domains=child_link_domains):
             continue
 
         if allowed_paths or excluded_paths:
             if not _matches_path_filter(full_url, allowed_paths or [], excluded_paths or []):
+                continue
+
+        # URL scoring: skip URLs that score below threshold when patterns active.
+        # Threshold is 2 when positive patterns are set (URL must earn its way in);
+        # 0 when only negative patterns are set (just block known bad paths).
+        if use_scoring:
+            score = _url_score(
+                full_url,
+                positive_url_patterns or [],
+                negative_url_patterns or [],
+            )
+            threshold = 2 if positive_url_patterns else 0
+            if score < threshold:
                 continue
 
         if full_url not in candidates:
