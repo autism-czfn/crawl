@@ -1,4 +1,6 @@
 """Scheduler: polls surfaces on their configured intervals and dispatches collectors."""
+from __future__ import annotations
+
 import asyncio
 import importlib
 import json
@@ -91,7 +93,7 @@ class Scheduler:
                     surface = Surface(
                         key=s["key"],
                         platform=s["platform"],
-                        enabled=s.get("enabled", True),
+                        enabled=bool(s.get("enabled", 1)),  # accepts 1/0 or true/false
                         poll_interval_sec=s.get("poll_interval_sec", 3600),
                         max_items_per_run=s.get("max_items", 30),
                         config_json=s.get("config", {}),
@@ -116,7 +118,7 @@ class Scheduler:
                         .where(Surface.key == s["key"])
                         .values(
                             platform=s["platform"],
-                            enabled=s.get("enabled", existing.enabled),
+                            enabled=bool(s.get("enabled", existing.enabled)),  # accepts 1/0 or true/false
                             poll_interval_sec=s.get("poll_interval_sec", existing.poll_interval_sec),
                             max_items_per_run=s.get("max_items", existing.max_items_per_run),
                             config_json=effective_config,

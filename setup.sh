@@ -91,31 +91,90 @@ run_migrations() {
 }
 
 # ── PID helpers ────────────────────────────────────────────────────────────────
+# Pattern used to identify the crawler process regardless of who started it.
+# Must NOT start with "-" or pgrep will treat it as a flag.
+CRAWLER_PGREP_PATTERN="src[.]main"
+ADMIN_PGREP_PATTERN="admin_site/manage[.]py.*runserver"
+
+# Find the crawler PID by looking for a Python process launched with "-m src.main".
+# Matching " -m src.main" (with space, without a colon suffix) avoids false
+# positives from uvicorn apps whose module path also contains "src.main:app".
+_find_crawler_pid() {
+    ps -eo pid,cmd --no-headers 2>/dev/null \
+        | awk '$2 ~ /python/ && / -m src[.]main( |$)/ {print $1}' \
+        | head -1
+}
+
+# Find the Django admin PID — always return the PARENT (reloader) process.
+# runserver spawns two processes: a file-watcher parent and an HTTP-server child.
+# Killing the parent takes down both; killing only the child causes the parent
+# to immediately respawn it.  sort -n gives lowest PID = the parent.
+_find_admin_pid() {
+    ps -eo pid,cmd --no-headers 2>/dev/null \
+        | awk '$2 ~ /python/ && /admin_site\/manage[.]py/ && /runserver/ {print $1}' \
+        | sort -n \
+        | head -1
+}
+
 is_running() {
+    # 1. PID file exists — check the process is alive AND is actually the crawler.
+    #    (The file may contain a stale PID from a shell wrapper, not a python process.)
     if [[ -f "$PID_FILE" ]]; then
         local pid
         pid=$(cat "$PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
-            return 0   # running
+            # Validate: the stored PID must be a python -m src.main process.
+            if ps -p "$pid" -o cmd --no-headers 2>/dev/null \
+               | awk '$1 ~ /python/ && / -m src[.]main( |$)/ {found=1} END {exit !found}'; then
+                return 0   # running, PID file is valid
+            fi
         fi
+        # Dead or wrong process — discard the stale file and fall through.
+        rm -f "$PID_FILE"
     fi
+
+    # 2. Fallback: find by process scan (handles processes started by other
+    #    parents, e.g. a Claude agent).  Adopt the PID so the rest of the
+    #    script can manage it normally.
+    local found_pid
+    found_pid=$(_find_crawler_pid)
+    if [[ -n "$found_pid" ]]; then
+        echo "$found_pid" > "$PID_FILE"   # adopt externally-started process
+        return 0
+    fi
+
     return 1   # not running
 }
 
 stop_existing() {
-    if is_running; then
+    # Refresh / adopt PID before stopping.
+    is_running || true
+
+    if [[ -f "$PID_FILE" ]]; then
         local pid
         pid=$(cat "$PID_FILE")
         warn "Stopping existing crawler process (PID $pid) ..."
-        kill "$pid"
-        # Wait up to 10 s for clean exit
+        kill "$pid" 2>/dev/null || true
+        # Wait up to 10 s for clean exit.
         local i=0
         while kill -0 "$pid" 2>/dev/null && [[ $i -lt 10 ]]; do
             sleep 1; i=$((i + 1))
         done
-        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" || true
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
         rm -f "$PID_FILE"
         success "Stopped."
+    fi
+
+    # Kill any additional stragglers that share the same command pattern
+    # (e.g. child worker processes spawned by the main process).
+    local stragglers
+    stragglers=$(pgrep -f "$CRAWLER_PGREP_PATTERN" 2>/dev/null || true)
+    if [[ -n "$stragglers" ]]; then
+        warn "Killing remaining crawler processes: $(echo "$stragglers" | tr '\n' ' ')"
+        echo "$stragglers" | xargs kill 2>/dev/null || true
+        sleep 2
+        stragglers=$(pgrep -f "$CRAWLER_PGREP_PATTERN" 2>/dev/null || true)
+        [[ -n "$stragglers" ]] && echo "$stragglers" | xargs kill -9 2>/dev/null || true
     fi
 }
 
@@ -190,29 +249,57 @@ only_migrate() {
 
 # ── Django admin PID helpers ───────────────────────────────────────────────────
 is_admin_running() {
+    # 1. PID file exists — validate it's alive AND is actually the Django admin.
     if [[ -f "$ADMIN_PID_FILE" ]]; then
         local pid
         pid=$(cat "$ADMIN_PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
-            return 0
+            if ps -p "$pid" -o cmd --no-headers 2>/dev/null \
+               | awk '$1 ~ /python/ && /admin_site\/manage[.]py/ && /runserver/ {found=1} END {exit !found}'; then
+                return 0
+            fi
         fi
+        rm -f "$ADMIN_PID_FILE"
     fi
+
+    # 2. Process-scan fallback — adopt externally-started admin process.
+    local found_pid
+    found_pid=$(_find_admin_pid)
+    if [[ -n "$found_pid" ]]; then
+        echo "$found_pid" > "$ADMIN_PID_FILE"   # adopt externally-started process
+        return 0
+    fi
+
     return 1
 }
 
 stop_existing_admin() {
-    if is_admin_running; then
+    # Refresh / adopt PID before stopping.
+    is_admin_running || true
+
+    if [[ -f "$ADMIN_PID_FILE" ]]; then
         local pid
         pid=$(cat "$ADMIN_PID_FILE")
         warn "Stopping existing Django admin process (PID $pid) ..."
-        kill "$pid"
+        kill "$pid" 2>/dev/null || true
         local i=0
         while kill -0 "$pid" 2>/dev/null && [[ $i -lt 10 ]]; do
             sleep 1; i=$((i + 1))
         done
-        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" || true
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
         rm -f "$ADMIN_PID_FILE"
         success "Stopped."
+    fi
+
+    # Kill any stragglers.
+    local stragglers
+    stragglers=$(pgrep -f "$ADMIN_PGREP_PATTERN" 2>/dev/null || true)
+    if [[ -n "$stragglers" ]]; then
+        warn "Killing remaining Django admin processes: $(echo "$stragglers" | tr '\n' ' ')"
+        echo "$stragglers" | xargs kill 2>/dev/null || true
+        sleep 2
+        stragglers=$(pgrep -f "$ADMIN_PGREP_PATTERN" 2>/dev/null || true)
+        [[ -n "$stragglers" ]] && echo "$stragglers" | xargs kill -9 2>/dev/null || true
     fi
 }
 
@@ -913,26 +1000,30 @@ check_status() {
     echo
     info "=== Service status ==="
     echo
+
+    # ── Crawler ──
+    # is_running() adopts an externally-started process if found via pgrep.
     if is_running; then
         local pid
         pid=$(cat "$PID_FILE")
-        success "Crawler is RUNNING  (PID $pid)"
-        echo
-        # Memory / CPU via ps
-        ps -p "$pid" -o pid,pcpu,pmem,etime,cmd --no-headers 2>/dev/null \
-            | awk '{printf "  PID: %s  CPU: %s%%  MEM: %s%%  Uptime: %s\n", $1,$2,$3,$4}' || true
+        local cmd
+        cmd=$(ps -p "$pid" -o cmd --no-headers 2>/dev/null | head -1 || echo "n/a")
+        success "Crawler     UP   │ PID $pid │ $cmd"
     else
-        warn "Crawler is NOT running."
+        warn    "Crawler     DOWN"
     fi
 
-    echo
-    info "=== Last 30 log lines ($LOG_FILE) ==="
-    echo
-    if [[ -f "$LOG_FILE" ]]; then
-        tail -30 "$LOG_FILE"
+    # ── Django admin ──
+    if is_admin_running; then
+        local apid
+        apid=$(cat "$ADMIN_PID_FILE")
+        local acmd
+        acmd=$(ps -p "$apid" -o cmd --no-headers 2>/dev/null | head -1 || echo "n/a")
+        success "Django admin UP   │ PID $apid │ $acmd"
     else
-        warn "No log file found yet."
+        warn    "Django admin DOWN"
     fi
+
     echo
 }
 
