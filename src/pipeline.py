@@ -5,6 +5,7 @@ import hashlib
 import logging
 import re
 from datetime import datetime, timezone
+from urllib.parse import urldefrag
 
 from sqlalchemy import select, update, text
 from sqlalchemy.dialects.postgresql import insert
@@ -32,7 +33,7 @@ async def save_items(
     inserted = 0
     for item in items:
         title = (item.get("title") or "").strip()
-        url = (item.get("url") or "").strip()
+        url, _ = urldefrag((item.get("url") or "").strip())  # strip #fragments — they're not separate pages
         if not title or not url:
             continue
 
@@ -285,16 +286,32 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 20) -> int:
 
 
 async def enrich_fulltext_loop() -> None:
-    """Long-running loop: enriches OA records with full text every 6 hours."""
+    """Long-running loop: enriches academic records with full text every 6 hours.
+
+    Step 1 — enrich_unpaywall: for every item with a DOI, fetch its open-access
+              URL from Unpaywall and store it in oa_url.
+    Step 2 — enrich_fulltext: for every item with oa_url set, fetch and store
+              the actual HTML/PDF content into content_body.
+
+    Both steps must run in order — fulltext has nothing to fetch until
+    Unpaywall has populated oa_url.
+    """
     import asyncio as _asyncio
     _interval = 6 * 3600
     logger.info("enrich_fulltext loop started (interval=%ds)", _interval)
     while True:
         try:
+            # Step 1: resolve OA URLs for items with DOI
             async with AsyncSessionLocal() as session:
-                count = await enrich_fulltext(session)
-                if count:
-                    logger.info("enrich_fulltext: enriched %d records", count)
+                oa_count = await enrich_unpaywall(session)
+                if oa_count:
+                    logger.info("enrich_unpaywall: resolved %d OA URLs", oa_count)
+
+            # Step 2: fetch full text for items that now have an OA URL
+            async with AsyncSessionLocal() as session:
+                ft_count = await enrich_fulltext(session)
+                if ft_count:
+                    logger.info("enrich_fulltext: enriched %d records with full text", ft_count)
         except Exception as exc:
             logger.error("enrich_fulltext loop error: %s", exc)
         await _asyncio.sleep(_interval)

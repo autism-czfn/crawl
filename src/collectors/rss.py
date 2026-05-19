@@ -111,6 +111,7 @@ async def collect(
 
     # Secondary pass: fetch full article body for each item
     from src.extractors.html import extract_body
+    fetched = skipped = 0
     for item in items:
         url = item.get("url", "")
         if not url:
@@ -122,7 +123,14 @@ async def collect(
             body = extract_body(art_soup)
             if body:
                 item["content_body"] = body
+                fetched += 1
+            else:
+                skipped += 1
+                logger.warning("RSS body too short/boilerplate, skipped: %s", url)
         except Exception as exc:
-            logger.debug("RSS article body fetch failed for %s: %s", url, exc)
+            skipped += 1
+            logger.warning("RSS article body fetch failed for %s: %s", url, exc)
+    if fetched or skipped:
+        logger.info("RSS secondary fetch: %d bodies extracted, %d failed/skipped", fetched, skipped)
 
     return items, new_cursor or cursor
