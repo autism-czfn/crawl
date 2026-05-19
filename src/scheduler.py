@@ -276,3 +276,44 @@ def _is_due(surface: Surface, now: datetime) -> bool:
         last = last.replace(tzinfo=timezone.utc)
     elapsed = (now - last).total_seconds()
     return elapsed >= surface.poll_interval_sec
+
+
+# ---------------------------------------------------------------------------
+# P3-D: Crawl health metrics
+# ---------------------------------------------------------------------------
+
+async def log_health_metrics() -> None:
+    """Emit structured JSON health metrics every hour."""
+    import json
+    metrics_logger = logging.getLogger("crawl.metrics")
+    while True:
+        try:
+            from sqlalchemy import func
+            from sqlalchemy import select as _select
+            from src.storage.models import CrawledItem as _CrawledItem, Chunk as _Chunk, Surface as _Surface
+
+            async with AsyncSessionLocal() as session:
+                embedding_queue = await session.scalar(
+                    _select(func.count()).select_from(_CrawledItem)
+                    .where(_CrawledItem.embedding.is_(None))
+                    .where(_CrawledItem.content_body.isnot(None))
+                )
+                chunk_queue = await session.scalar(
+                    _select(func.count()).select_from(_CrawledItem)
+                    .where(_CrawledItem.content_body.isnot(None))
+                    .where(_CrawledItem.content_body != "")
+                )
+                fail_surfaces = await session.scalar(
+                    _select(func.count()).select_from(_Surface)
+                    .where(_Surface.consecutive_fails > 3)
+                )
+
+            metrics_logger.info(json.dumps({
+                "metric": "crawl_health",
+                "embedding_queue_depth": embedding_queue,
+                "chunk_queue_depth": chunk_queue,
+                "surfaces_failing": fail_surfaces,
+            }))
+        except Exception as exc:
+            metrics_logger.error("Health metrics error: %s", exc)
+        await asyncio.sleep(3600)

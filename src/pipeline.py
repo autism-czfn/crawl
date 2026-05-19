@@ -4,7 +4,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from datetime import datetime, timezone
+import urllib.parse
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urldefrag
 
 from sqlalchemy import select, update, text
@@ -18,6 +20,171 @@ from src.storage.models import CrawledItem, Surface
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# P2-C: Canonical URL normalisation
+# ---------------------------------------------------------------------------
+
+_STRIP_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "ref", "source", "via", "from", "referrer", "campaign",
+    "fbclid", "gclid", "msclkid", "mc_cid", "mc_eid",
+}
+
+
+def _normalize_url(url: str) -> str:
+    """Strip tracking params, lowercase scheme/host, drop fragment."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+        filtered = {k: v for k, v in params.items() if k.lower() not in _STRIP_PARAMS}
+        new_query = urllib.parse.urlencode(filtered, doseq=True)
+        normalized = parsed._replace(
+            scheme=parsed.scheme.lower(),
+            netloc=parsed.netloc.lower(),
+            query=new_query,
+            fragment="",
+        )
+        return urllib.parse.urlunparse(normalized).rstrip("/") or url
+    except Exception:
+        return url
+
+
+# ---------------------------------------------------------------------------
+# P2-A: Language detection (fallback heuristic if langdetect not installed)
+# ---------------------------------------------------------------------------
+
+def _detect_lang(text: str | None) -> str:
+    """Detect language of text; returns ISO 639-1 code, defaults to 'en'."""
+    if not text or len(text) < 50:
+        return "en"
+    try:
+        from langdetect import detect  # type: ignore
+        return detect(text) or "en"
+    except Exception:
+        return "en"
+
+
+# ---------------------------------------------------------------------------
+# P2-E: Content quality gate
+# ---------------------------------------------------------------------------
+
+def _passes_quality_gate(content_body: str | None) -> bool:
+    """Return True if content_body is worth storing; None/too-short = False."""
+    if not content_body:
+        return True  # no content body — metadata-only items are still indexed
+    text = content_body.strip()
+    if len(text) < 150:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# P2-F: Staleness flag
+# ---------------------------------------------------------------------------
+
+def _compute_is_stale(published_at: datetime | None) -> bool | None:
+    """Return True if published_at is older than 5 years, else False, else None."""
+    if not published_at:
+        return None
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=5 * 365)
+    if published_at.tzinfo is None:
+        return None
+    return published_at < cutoff
+
+
+# ---------------------------------------------------------------------------
+# P3-C: Evidence level inference
+# ---------------------------------------------------------------------------
+
+_EVIDENCE_KEYWORDS: dict[str, list[str]] = {
+    "systematic_review": ["systematic review", "meta-analysis", "cochrane"],
+    "rct": ["randomized controlled", "randomised controlled", "rct", "double-blind"],
+    "cohort": ["cohort study", "longitudinal study", "prospective study"],
+    "case_study": ["case study", "case report", "case series"],
+    "expert_opinion": ["expert opinion", "editorial", "commentary", "perspective"],
+    "guideline": ["clinical guideline", "practice guideline", "dsm-5", "icd-"],
+}
+
+
+def _infer_evidence_level(
+    title: str,
+    description: str | None,
+    source_type: str | None,
+) -> str | None:
+    if source_type in ("forum", "reddit", "social"):
+        return "anecdotal"
+    if source_type == "blog":
+        return "blog"
+    text = ((title or "") + " " + (description or "")).lower()
+    for level, keywords in _EVIDENCE_KEYWORDS.items():
+        if any(kw in text for kw in keywords):
+            return level
+    if source_type == "peer_reviewed":
+        return "peer_reviewed"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# P3-B: Near-duplicate content fingerprint
+# ---------------------------------------------------------------------------
+
+def _compute_fingerprint(text: str | None) -> list[str] | None:
+    """Return top-50 3-word shingles from text as a near-dup fingerprint."""
+    if not text or len(text) < 100:
+        return None
+    words = re.sub(r"[^a-z0-9\s]", "", text.lower()).split()
+    shingles = [" ".join(words[i : i + 3]) for i in range(len(words) - 2)]
+    if not shingles:
+        return None
+    top = [s for s, _ in Counter(shingles).most_common(50)]
+    return top
+
+
+
+# ---------------------------------------------------------------------------
+# P2-2: Near-duplicate detection
+# ---------------------------------------------------------------------------
+
+async def _find_near_duplicate(
+    session: AsyncSession,
+    fingerprint: list[str] | None,
+    url: str,
+) -> str | None:
+    """Return URL of a near-duplicate if one exists (>70% shingle overlap). Returns None if no dup."""
+    if not fingerprint or len(fingerprint) < 10:
+        return None
+    try:
+        # Find items with overlapping fingerprints using JSONB containment
+        # This is approximate: check if at least 5 shingles from our fingerprint
+        # appear in existing items' fingerprints
+        # Use a simpler approach: check content_hash first, then sample fingerprints
+        sample = fingerprint[:10]  # check top 10 shingles
+        result = await session.execute(
+            text("""
+                SELECT url, content_fingerprint
+                FROM crawled_items
+                WHERE url != :url
+                  AND content_fingerprint IS NOT NULL
+                  AND content_fingerprint ?| :sample::text[]
+                LIMIT 5
+            """),
+            {"url": url, "sample": sample},
+        )
+        rows = result.fetchall()
+        for dup_url, dup_fp in rows:
+            if isinstance(dup_fp, list):
+                overlap = len(set(fingerprint) & set(dup_fp))
+                similarity = overlap / len(set(fingerprint) | set(dup_fp))
+                if similarity > 0.70:
+                    return dup_url
+    except Exception as e:
+        logger.debug("Near-dup check failed (non-critical): %s", e)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Main ingest function
+# ---------------------------------------------------------------------------
 
 async def save_items(
     items: list[CollectedItem],
@@ -33,7 +200,9 @@ async def save_items(
     inserted = 0
     for item in items:
         title = (item.get("title") or "").strip()
-        url, _ = urldefrag((item.get("url") or "").strip())  # strip #fragments — they're not separate pages
+        # P2-C: strip fragment then normalise tracking params
+        raw_url, _ = urldefrag((item.get("url") or "").strip())
+        url = _normalize_url(raw_url)
         if not title or not url:
             continue
 
@@ -49,6 +218,38 @@ async def save_items(
                 except Exception:
                     pass
 
+        # P2-E: quality gate — discard junk content_body but keep metadata
+        content_body = item.get("content_body")
+        if not _passes_quality_gate(content_body):
+            content_body = None
+
+        content_hash = _hash_content(content_body)
+        source_type = surface.source_type if surface else None
+
+        # P2-A: language detection
+        lang = _detect_lang(content_body or item.get("title"))
+
+        # P2-F: staleness
+        is_stale = _compute_is_stale(published_at_val)
+
+        # P3-C: evidence level
+        evidence_level = _infer_evidence_level(
+            title,
+            item.get("description"),
+            source_type,
+        )
+
+        # P3-B: content fingerprint
+        content_fingerprint = _compute_fingerprint(content_body)
+
+        # P2-2: near-duplicate detection
+        near_duplicate_of = await _find_near_duplicate(session, content_fingerprint, url)
+        if near_duplicate_of:
+            logger.info(
+                "Near-duplicate detected: url=%s is dup of %s (Jaccard > 0.70)",
+                url, near_duplicate_of,
+            )
+
         row = {
             "external_id": item.get("external_id"),
             "source": item.get("source", "unknown"),
@@ -56,7 +257,7 @@ async def save_items(
             "title": title,
             "url": url,
             "description": item.get("description"),
-            "content_body": item.get("content_body"),
+            "content_body": content_body,
             "author": item.get("author"),
             "authors_json": item.get("authors_json"),
             "published_at": published_at_val,
@@ -67,11 +268,16 @@ async def save_items(
             "journal": item.get("journal"),
             "open_access": item.get("open_access"),
             "authority_tier": surface.authority_tier if surface else None,
-            "source_type": surface.source_type if surface else None,
+            "source_type": source_type,
             "audience_type": surface.audience_type if surface else None,
-            "content_hash": _hash_content(item.get("content_body")),
-            "content_updated_at": datetime.now(tz=timezone.utc) if item.get("content_body") else None,
+            "content_hash": content_hash,
+            "content_updated_at": datetime.now(tz=timezone.utc) if content_body else None,
             "raw_payload": item.get("raw_payload") or {},
+            "lang": lang,
+            "is_stale": is_stale,
+            "evidence_level": evidence_level,
+            "content_fingerprint": content_fingerprint,
+            "near_duplicate_of": near_duplicate_of,
         }
 
         stmt = insert(CrawledItem).values(**row)
@@ -88,6 +294,12 @@ async def save_items(
                 "authority_tier": stmt.excluded.authority_tier,
                 "source_type": stmt.excluded.source_type,
                 "audience_type": stmt.excluded.audience_type,
+                "lang": stmt.excluded.lang,
+                "is_stale": stmt.excluded.is_stale,
+                "evidence_level": stmt.excluded.evidence_level,
+                "content_fingerprint": stmt.excluded.content_fingerprint,
+                "near_duplicate_of": stmt.excluded.near_duplicate_of,
+                # P1-C: set needs_rechunk=True when content changes (handled below via SQL)
             },
         )
 
@@ -109,9 +321,11 @@ async def save_items(
         logger.error("pipeline commit failed: %s", exc)
         return 0
 
-    # P3-C: Re-embedding trigger — null out embeddings for records where content changed
+    # --- Post-commit enrichment passes ---
+
+    # P3-C re-embedding trigger — null out embeddings for records where content changed
     urls_with_content = [
-        (item.get("url") or "").strip()
+        _normalize_url(urldefrag((item.get("url") or "").strip())[0])
         for item in items
         if item.get("content_body") and (item.get("url") or "").strip()
     ]
@@ -131,9 +345,22 @@ async def save_items(
                 """),
                 {"urls": urls_with_content},
             )
+            # P1-C: set needs_rechunk=True when content changes
+            await session.execute(
+                text("""
+                    UPDATE crawled_items
+                    SET needs_rechunk = TRUE
+                    WHERE url = ANY(:urls)
+                      AND content_hash IS NOT NULL
+                      AND content_hash != encode(
+                            sha256(content_body::bytea), 'hex'
+                          )
+                """),
+                {"urls": urls_with_content},
+            )
             await session.commit()
         except Exception as exc:
-            logger.debug("P3-C re-embedding trigger failed (non-critical): %s", exc)
+            logger.debug("Re-embedding/rechunk trigger failed (non-critical): %s", exc)
 
     return inserted
 

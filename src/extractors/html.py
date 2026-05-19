@@ -123,3 +123,78 @@ def _clean_text(text: str | None) -> str | None:
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text or None
+
+
+# ---------------------------------------------------------------------------
+# P2-B: Heading-aware structured extraction (future use)
+# ---------------------------------------------------------------------------
+
+_MAX_SECTION_CHARS = 5000  # prevent massive sections from overwhelming downstream chunker
+
+
+def extract_structured(soup: BeautifulSoup) -> list[dict]:
+    """Walk h1/h2/h3 tags and collect text under each heading.
+
+    Returns a list of dicts:
+        [{"heading": str, "level": int, "text": str}, ...]
+
+    Edge cases handled:
+    - No headings found → returns [{"heading": "", "level": 0, "text": full_body}]
+    - Empty sections (heading with no body text) → stripped
+    - Section text capped at _MAX_SECTION_CHARS (5000 chars) to prevent oversized sections
+
+    NOTE: Not yet wired into the pipeline — requires content_body storage to
+    preserve HTML structure.  Use together with chunk_structured() from
+    src/chunker.py when that refactor lands.
+    """
+    # Clone soup to avoid mutating the original
+    work = BeautifulSoup(str(soup), "html.parser")
+    for tag in work.find_all(["nav", "footer", "aside", "header", "script", "style", "noscript"]):
+        tag.decompose()
+
+    body = work.find("body") or work
+
+    _HEADING_LEVEL = {"h1": 1, "h2": 2, "h3": 3}
+
+    sections: list[dict] = []
+    current_heading = ""
+    current_level = 0
+    current_parts: list[str] = []
+
+    for element in body.descendants:
+        if not hasattr(element, "name"):
+            continue
+        if element.name in _HEADING_LEVEL:
+            # Flush previous section (skip empty sections)
+            if current_parts:
+                text = " ".join(current_parts).strip()[:_MAX_SECTION_CHARS]
+                if text:
+                    sections.append({
+                        "heading": current_heading,
+                        "level": current_level,
+                        "text": text,
+                    })
+            current_heading = element.get_text(" ", strip=True)
+            current_level = _HEADING_LEVEL[element.name]
+            current_parts = []
+        elif element.name in ("p", "li", "blockquote", "td", "dd"):
+            snippet = element.get_text(" ", strip=True)
+            if snippet:
+                current_parts.append(snippet)
+
+    # Flush last section (skip if empty)
+    if current_parts:
+        text = " ".join(current_parts).strip()[:_MAX_SECTION_CHARS]
+        if text:
+            sections.append({
+                "heading": current_heading,
+                "level": current_level,
+                "text": text,
+            })
+
+    if not sections:
+        # Fallback: no headings found — return full body text as a single section
+        full_text = body.get_text(" ", strip=True)[:_MAX_SECTION_CHARS]
+        return [{"heading": "", "level": 0, "text": full_text}]
+
+    return sections

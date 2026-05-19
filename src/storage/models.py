@@ -5,6 +5,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase
 from pgvector.sqlalchemy import Vector
+# JSONB already imported above; no extra import needed for content_fingerprint
 
 
 class Base(DeclarativeBase):
@@ -43,6 +44,18 @@ class CrawledItem(Base):
     embedded_at = Column(DateTime(timezone=True), nullable=True)
     oa_url = Column(Text, nullable=True)
     last_harvested_at = Column(DateTime(timezone=True), nullable=True)
+    # Sprint 1-C: re-chunk trigger
+    needs_rechunk = Column(Boolean, nullable=False, default=False)
+    # Sprint 2-F: staleness flag
+    is_stale = Column(Boolean, nullable=True, default=False)
+    # Sprint 3-C: evidence level
+    evidence_level = Column(Text, nullable=True)
+    # Sprint 3-B: near-duplicate fingerprint
+    content_fingerprint = Column(JSONB, nullable=True)
+    # P2-2: near-duplicate detection
+    near_duplicate_of = Column(Text, nullable=True)   # URL of canonical item if near-dup detected
+    # P2-3: embedding schema version
+    embedding_schema_version = Column(Text, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("url", name="uq_crawled_items_url"),
@@ -62,6 +75,21 @@ class Chunk(Base):
     embedding = Column(Vector(768), nullable=True)
     embedding_model = Column(Text, nullable=True)
     embedded_at = Column(DateTime(timezone=True), nullable=True)
+    # Metadata columns (Sprint 1-B)
+    title = Column(Text, nullable=True)
+    url = Column(Text, nullable=True)
+    domain = Column(Text, nullable=True)
+    source_type = Column(Text, nullable=True)
+    authority_tier = Column(Integer, nullable=True)
+    published_at = Column(DateTime(timezone=True), nullable=True)
+    lang = Column(Text, nullable=True)
+    # Parent-child retrieval (Sprint 4-A)
+    is_summary = Column(Boolean, nullable=True, default=False)
+    # Heading-aware chunking (P1-1)
+    section_heading = Column(Text, nullable=True)
+    heading_path = Column(Text, nullable=True)   # e.g. "Symptoms > Sleep Disorders"
+    # P2-3: embedding schema version
+    embedding_schema_version = Column(Text, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("crawled_item_id", "chunk_index", name="uq_chunk_item_index"),

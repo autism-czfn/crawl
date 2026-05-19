@@ -16,6 +16,10 @@ from src.embedder import MODEL_NAME, embed_texts
 from src.storage.db import AsyncSessionLocal
 from src.storage.models import Chunk, CrawledItem
 
+# Increment when chunking strategy or prefix convention changes.
+# All embeddings with a different (or NULL) schema version will be re-generated.
+EMBEDDING_SCHEMA_VERSION = "v2"
+
 logger = logging.getLogger(__name__)
 
 _BATCH_SIZE = 100
@@ -64,6 +68,7 @@ async def run_once(max_items: int = _MAX_PER_RUN) -> int:
                         embedding=vector,
                         embedding_model=MODEL_NAME,
                         embedded_at=datetime.now(tz=timezone.utc),
+                        embedding_schema_version=EMBEDDING_SCHEMA_VERSION,
                     )
                 )
             await session.commit()
@@ -109,7 +114,7 @@ async def run_once_chunks(max_items: int = _MAX_PER_RUN) -> int:
     for batch_start in range(0, len(rows), _BATCH_SIZE):
         batch = rows[batch_start : batch_start + _BATCH_SIZE]
         ids = [r.id for r in batch]
-        texts = [r.chunk_text[:2000] for r in batch]
+        texts = [r.chunk_text for r in batch]  # nomic-embed-text-v1.5 handles up to 8192 tokens natively
 
         try:
             vectors = await asyncio.to_thread(embed_texts, texts)
@@ -129,6 +134,7 @@ async def run_once_chunks(max_items: int = _MAX_PER_RUN) -> int:
                         embedding=vector,
                         embedding_model=MODEL_NAME,
                         embedded_at=datetime.now(tz=timezone.utc),
+                        embedding_schema_version=EMBEDDING_SCHEMA_VERSION,
                     )
                 )
             await session.commit()
