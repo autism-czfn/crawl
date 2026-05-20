@@ -1,11 +1,13 @@
 import asyncio
 import logging
 from src.config import settings
-from src.captions import run_loop as caption_loop
 from src.chunk_pipeline import run_loop as chunk_loop
 from src.embeddings import run_loop as embedding_loop
 from src.pipeline import enrich_fulltext_loop
 from src.scheduler import Scheduler, log_health_metrics
+
+# captions.py (yt-dlp based) is disabled — YouTube transcripts are now fetched
+# directly by the YouTube collector via youtube-transcript-api at collection time.
 
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL, logging.INFO))
 logger = logging.getLogger(__name__)
@@ -18,7 +20,6 @@ async def main() -> None:
         scheduler.run(),
         embedding_loop(),
         chunk_loop(),
-        caption_loop(),
         enrich_fulltext_loop(),
         log_health_metrics(),
     )

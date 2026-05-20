@@ -376,9 +376,8 @@ show_db_stats() {
         echo; return
     fi
 
-    # Use the project's own Python/psycopg2 — no psql needed
     "$PYTHON" - << 'PYEOF'
-import os, sys, json, pathlib
+import os, sys, json, pathlib, re
 
 # ── Load .env ──
 for line in pathlib.Path(".env").read_text().splitlines():
@@ -392,43 +391,140 @@ if not db_url:
     print("  \033[0;31m[ERROR]\033[0m  DATABASE_URL not set in .env")
     sys.exit(1)
 
-# Strip SQLAlchemy driver prefix (e.g. postgresql+asyncpg:// → postgresql://)
-import re
 db_url = re.sub(r"^(postgresql)\+\w+://", r"\1://", db_url)
 
 BOLD  = "\033[1m"
+DIM   = "\033[2m"
 GREEN = "\033[0;32m"
+CYAN  = "\033[0;36m"
 WARN  = "\033[1;33m"
-ERR   = "\033[0;31m"
 RESET = "\033[0m"
 
-# ── DB size & crawled items ──
-db_size = item_count = "N/A"
+def bar(n, total, width=20):
+    """Simple ASCII progress bar."""
+    if total == 0:
+        return "[" + "-" * width + "]"
+    filled = int(round(n / total * width))
+    return "[" + "█" * filled + "─" * (width - filled) + "]"
+
+def pct(n, total):
+    return f"{n/total*100:.0f}%" if total else "─"
+
 try:
     import psycopg2
     conn = psycopg2.connect(db_url)
     cur  = conn.cursor()
+
+    # ── Header: DB overview ───────────────────────────────────────────────────
     cur.execute("SELECT pg_size_pretty(pg_database_size(current_database()));")
     db_size = cur.fetchone()[0].strip()
+
     cur.execute("SELECT COUNT(*) FROM crawled_items;")
-    item_count = f"{cur.fetchone()[0]:,}"
+    total_items = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM chunks;")
+    total_chunks = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL;")
+    total_embedded = cur.fetchone()[0]
+
+    print(f"  {BOLD}DB size:{RESET}        {GREEN}{db_size}{RESET}")
+    print(f"  {BOLD}Total articles:{RESET} {GREEN}{total_items:,}{RESET}")
+    print(f"  {BOLD}Total chunks:{RESET}   {GREEN}{total_chunks:,}{RESET}  "
+          f"({GREEN}{total_embedded:,}{RESET} embedded / indexed)")
+    print()
+
+    # ── Load tier info from surfaces.json ─────────────────────────────────────
+    surfaces = json.loads(pathlib.Path("config/surfaces.json").read_text())
+    tier_by_key = {s["key"]: s.get("authority_tier") for s in surfaces}
+
+    # ── Per-source breakdown (tier 1 & 2 only) ────────────────────────────────
+    cur.execute("""
+        SELECT
+            ci.surface_key,
+            COUNT(*)                                            AS total,
+            COUNT(ci.content_body)                             AS has_content,
+            COUNT(CASE WHEN LENGTH(ci.content_body) >= 1000
+                       THEN 1 END)                             AS full_text,
+            COUNT(CASE WHEN ci.content_body IS NOT NULL
+                        AND LENGTH(ci.content_body) < 1000
+                       THEN 1 END)                             AS abstract_only,
+            COUNT(DISTINCT ch.crawled_item_id)                 AS chunked,
+            COUNT(CASE WHEN ch.embedding IS NOT NULL THEN 1 END) AS embedded
+        FROM crawled_items ci
+        LEFT JOIN chunks ch ON ch.crawled_item_id = ci.id
+        GROUP BY ci.surface_key
+        ORDER BY ci.surface_key;
+    """)
+    rows = cur.fetchall()
+    # {surface_key: (total, has_content, full_text, abstract_only, chunked, embedded)}
+    stats = {r[0]: r[1:] for r in rows}
+
+    for tier_label, tier_num in [("Tier 1  (Official / Government)", 1),
+                                  ("Tier 2  (Academic / Medical)", 2)]:
+        tier_keys = sorted([k for k, t in tier_by_key.items() if t == tier_num])
+        if not tier_keys:
+            continue
+
+        print(f"  {BOLD}{'─'*70}{RESET}")
+        print(f"  {BOLD}{CYAN}{tier_label}{RESET}")
+        print(f"  {BOLD}{'─'*70}{RESET}")
+        print(f"  {BOLD}{'Surface':<32} {'Total':>6} {'FullTxt':>7} {'Abstract':>8} "
+              f"{'Chunked':>7} {'Embedded':>8}  Coverage{RESET}")
+        print(f"  {'─'*32} {'─'*6} {'─'*7} {'─'*8} {'─'*7} {'─'*8}  {'─'*22}")
+
+        tier_total = tier_full = tier_abstract = tier_chunked = tier_embedded = 0
+
+        for key in tier_keys:
+            if key not in stats:
+                # Surface enabled but nothing crawled yet
+                print(f"  {key:<32} {'─':>6} {'─':>7} {'─':>8} {'─':>7} {'─':>8}  {DIM}no data yet{RESET}")
+                continue
+
+            total, has_content, full_text, abstract_only, chunked, embedded = stats[key]
+            tier_total    += total
+            tier_full     += full_text
+            tier_abstract += abstract_only
+            tier_chunked  += chunked
+            tier_embedded += embedded
+
+            emb_bar = bar(embedded, total)
+            print(f"  {key:<32} {total:>6,} {full_text:>7,} {abstract_only:>8,} "
+                  f"{chunked:>7,} {embedded:>8,}  {emb_bar} {pct(embedded,total):>4}")
+
+        print(f"  {'─'*32} {'─'*6} {'─'*7} {'─'*8} {'─'*7} {'─'*8}")
+        print(f"  {BOLD}{'SUBTOTAL':<32} {tier_total:>6,} {tier_full:>7,} "
+              f"{tier_abstract:>8,} {tier_chunked:>7,} {tier_embedded:>8,}{RESET}")
+        print()
+
+    # ── Embedding coverage summary ─────────────────────────────────────────────
+    cur.execute("""
+        SELECT COUNT(*) FROM crawled_items ci
+        WHERE EXISTS (SELECT 1 FROM chunks ch
+                      WHERE ch.crawled_item_id = ci.id
+                        AND ch.embedding IS NOT NULL);
+    """)
+    items_with_embeddings = cur.fetchone()[0]
+
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    print(f"  {BOLD}Vector index coverage{RESET}")
+    print(f"  {'─'*70}")
+    print(f"  Articles with ≥1 embedded chunk : "
+          f"{GREEN}{items_with_embeddings:,}{RESET} / {total_items:,}  "
+          f"({pct(items_with_embeddings, total_items)})")
+    print(f"  Chunks embedded / total         : "
+          f"{GREEN}{total_embedded:,}{RESET} / {total_chunks:,}  "
+          f"({pct(total_embedded, total_chunks)})")
+    print(f"  {bar(total_embedded, total_chunks, width=40)}")
+    print()
+
     cur.close()
     conn.close()
-except Exception as e:
-    print(f"  {WARN}[WARN]{RESET}   DB query failed: {e}")
 
-# ── Active sources from surfaces.json ──
-source_count = "N/A"
-try:
-    surfaces = json.loads(pathlib.Path("config/surfaces.json").read_text())
-    source_count = sum(1 for s in surfaces if s.get("enabled", True))
 except Exception as e:
-    print(f"  {WARN}[WARN]{RESET}   Could not read surfaces.json: {e}")
-
-print(f"  {BOLD}DB Size:       {RESET}{GREEN}{db_size}{RESET}")
-print(f"  {BOLD}Crawled Items: {RESET}{GREEN}{item_count}{RESET}")
-print(f"  {BOLD}Active Sources:{RESET}{GREEN}{source_count}{RESET}  (config/surfaces.json)")
-print()
+    import traceback
+    print(f"  {WARN}[WARN]{RESET}  DB query failed: {e}")
+    traceback.print_exc()
 PYEOF
 }
 

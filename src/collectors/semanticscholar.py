@@ -1,16 +1,23 @@
-"""Semantic Scholar Graph API collector."""
+"""Semantic Scholar Graph API collector.
+
+Full-text strategy:
+  Request the openAccessPdf field.  When present, download and extract
+  text from the PDF using pdfplumber.
+"""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from src.collectors.base import CollectedItem, normalize_doi
+from src.collectors.fulltext import fetch_pdf_url
 from src.config import settings
 from src.http.client import get_shared_client
 
 logger = logging.getLogger(__name__)
 
 _BASE = "https://api.semanticscholar.org/graph/v1/paper/search"
-_FIELDS = "title,url,abstract,authors,year,externalIds,publicationDate,venue,isOpenAccess,citationCount"
+_FIELDS = "title,url,abstract,authors,year,externalIds,publicationDate,venue,isOpenAccess,openAccessPdf,citationCount"
 
 
 async def collect(
@@ -80,6 +87,8 @@ async def collect(
         else:
             published_at = None
 
+        pdf_url = (p.get("openAccessPdf") or {}).get("url")
+
         items.append(
             CollectedItem(
                 title=title,
@@ -87,7 +96,7 @@ async def collect(
                 source="semanticscholar",
                 external_id=p.get("paperId"),
                 description=p.get("abstract") or None,
-                content_body=None,
+                content_body=None,  # enriched below
                 author=authors_json[0]["family"] if authors_json else None,
                 authors_json=authors_json or None,
                 published_at=published_at,
@@ -96,9 +105,25 @@ async def collect(
                 journal=p.get("venue") or None,
                 open_access=p.get("isOpenAccess"),
                 engagement={"citation_count": p.get("citationCount", 0)},
-                raw_payload=p,
+                raw_payload={**p, "_pdf_url": pdf_url},
             )
         )
+
+    # Fetch PDFs concurrently for open-access papers
+    client = get_shared_client()
+
+    async def _enrich(item: CollectedItem) -> CollectedItem:
+        pdf_url = item.get("raw_payload", {}).pop("_pdf_url", None)
+        if pdf_url:
+            text = await fetch_pdf_url(client, pdf_url)
+            if text:
+                item["content_body"] = text
+        return item
+
+    items = list(await asyncio.gather(*[_enrich(item) for item in items]))
+
+    pdf_count = sum(1 for it in items if it.get("content_body"))
+    logger.info("SemanticScholar: %d papers, %d with PDF full text", len(items), pdf_count)
 
     next_cursor = str(new_offset) if new_offset < total else None
     return items, next_cursor

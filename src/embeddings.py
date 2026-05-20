@@ -3,10 +3,14 @@
 Schedule: run every 15 minutes, process up to 500 new items per batch.
 Embed text: title + ' ' + description[:500]
 Model: nomic-ai/nomic-embed-text-v1.5 (768 dims, local via fastembed — no API key required)
+
+Memory note: fastembed loads ~270 MB model + transformer inference can spike to several GB.
+Batch sizes are kept small to avoid OOM kills on machines with limited RAM (≤8 GB).
 """
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 from datetime import datetime, timezone
 
@@ -22,8 +26,11 @@ EMBEDDING_SCHEMA_VERSION = "v2"
 
 logger = logging.getLogger(__name__)
 
-_BATCH_SIZE = 100
-_MAX_PER_RUN = 500
+# Keep batches small to avoid OOM on ≤8 GB machines.
+# fastembed + 100 long chunks can spike to ~7 GB; 20 keeps peak well under 2 GB.
+_BATCH_SIZE = 20
+_CHUNK_BATCH_SIZE = 10        # chunks are longer text than item titles — use smaller batches
+_MAX_PER_RUN = 200            # reduced from 500; more frequent smaller passes are safer
 _INTERVAL_SEC = 900  # 15 minutes
 
 
@@ -76,6 +83,10 @@ async def run_once(max_items: int = _MAX_PER_RUN) -> int:
         total_embedded += len(batch)
         logger.info("Embedded %d items (total this run: %d)", len(batch), total_embedded)
 
+        # Release memory between batches to avoid OOM on low-RAM machines
+        del vectors, texts, ids, batch
+        gc.collect()
+
     return total_embedded
 
 
@@ -87,11 +98,12 @@ async def run_loop() -> None:
             count = await run_once()
             if count:
                 logger.info("Embedding run complete: %d items embedded", count)
+            logger.info("Embedding loop: starting chunk embedding pass")
             chunk_count = await run_once_chunks()
             if chunk_count:
                 logger.info("Chunk embedding run complete: %d chunks embedded", chunk_count)
         except Exception as exc:
-            logger.error("Embedding loop error: %s", exc)
+            logger.error("Embedding loop error: %s", exc, exc_info=True)
         await asyncio.sleep(_INTERVAL_SEC)
 
 
@@ -108,13 +120,16 @@ async def run_once_chunks(max_items: int = _MAX_PER_RUN) -> int:
         )
         rows = result.fetchall()
 
+    logger.info("Chunk embedding: %d chunks queued for embedding", len(rows))
     if not rows:
         return 0
 
-    for batch_start in range(0, len(rows), _BATCH_SIZE):
-        batch = rows[batch_start : batch_start + _BATCH_SIZE]
+    for batch_start in range(0, len(rows), _CHUNK_BATCH_SIZE):
+        batch = rows[batch_start : batch_start + _CHUNK_BATCH_SIZE]
         ids = [r.id for r in batch]
-        texts = [r.chunk_text for r in batch]  # nomic-embed-text-v1.5 handles up to 8192 tokens natively
+        # nomic-embed-text-v1.5 handles up to 8192 tokens natively, but long chunks
+        # consume significant GPU/CPU memory — keep batches small to avoid OOM.
+        texts = [r.chunk_text for r in batch]
 
         try:
             vectors = await asyncio.to_thread(embed_texts, texts)
@@ -141,6 +156,10 @@ async def run_once_chunks(max_items: int = _MAX_PER_RUN) -> int:
 
         total_embedded += len(batch)
         logger.info("Embedded %d chunks (total this run: %d)", len(batch), total_embedded)
+
+        # Release embedding vectors and input texts immediately to free RAM between batches
+        del vectors, texts, ids, batch
+        gc.collect()
 
     return total_embedded
 

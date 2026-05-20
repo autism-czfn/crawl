@@ -11,13 +11,13 @@ Parameters:
   ef_search=40      — query-time quality parameter (set per-connection in search code)
 
 Revision ID: 0018_hnsw_index
-Revises: 0017_add_embedding_schema_version
+Revises: 0017_embed_schema_version
 Create Date: 2026-05-19
 """
 from alembic import op
 
 revision = "0018_hnsw_index"
-down_revision = "0017_add_embedding_schema_version"
+down_revision = "0017_embed_schema_version"
 branch_labels = None
 depends_on = None
 

@@ -4,13 +4,13 @@ Tracks which embedding schema version (prefix convention, chunking strategy)
 was used to generate the vector. Increment EMBEDDING_SCHEMA_VERSION in
 crawl/src/embeddings.py to trigger re-embedding.
 
-Revision ID: 0017_add_embedding_schema_version
+Revision ID: 0017_embed_schema_version
 Revises: 0016_add_near_duplicate_of
 Create Date: 2026-05-19
 """
 from alembic import op
 
-revision = "0017_add_embedding_schema_version"
+revision = "0017_embed_schema_version"
 down_revision = "0016_add_near_duplicate_of"
 branch_labels = None
 depends_on = None

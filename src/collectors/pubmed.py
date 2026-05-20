@@ -1,10 +1,18 @@
-"""PubMed NCBI E-utilities collector."""
+"""PubMed NCBI E-utilities collector.
+
+Full-text strategy:
+  For each article, check if a PMC ID is present in the XML.  If so, fetch
+  the full text from pmc.ncbi.nlm.nih.gov (HTML → trafilatura, or efetch XML
+  fallback).  Articles without a PMC ID stay at abstract-only.
+"""
 from __future__ import annotations
 
+import asyncio
 import logging
 import xml.etree.ElementTree as ET
 
 from src.collectors.base import CollectedItem, normalize_doi
+from src.collectors.fulltext import fetch_pmc_fulltext
 from src.config import settings
 from src.http.client import get_shared_client
 
@@ -71,30 +79,47 @@ async def collect(
         logger.error("PubMed efetch failed: %s", exc)
         return [], cursor
 
-    items: list[CollectedItem] = []
+    parsed: list[tuple[CollectedItem, str | None]] = []
     for article in root.findall(".//PubmedArticle"):
         try:
-            item = _parse_article(article)
+            item, pmcid = _parse_article(article)
             if item:
-                items.append(item)
+                parsed.append((item, pmcid))
         except Exception as exc:
             logger.warning("Failed to parse PubMed article: %s", exc)
+
+    # Fetch full text concurrently for articles that have a PMC ID
+    client = get_shared_client()
+
+    async def _enrich(item: CollectedItem, pmcid: str | None) -> CollectedItem:
+        if pmcid:
+            text = await fetch_pmc_fulltext(client, pmcid)
+            if text:
+                item["content_body"] = text
+        return item
+
+    items: list[CollectedItem] = list(
+        await asyncio.gather(*[_enrich(item, pmcid) for item, pmcid in parsed])
+    )
+
+    pmc_count = sum(1 for _, pmcid in parsed if pmcid)
+    logger.info("PubMed: fetched %d articles, %d have PMC full text available", len(items), pmc_count)
 
     next_cursor = str(retstart + len(pmids)) if len(pmids) == limit else None
     return items, next_cursor
 
 
-def _parse_article(article: ET.Element) -> CollectedItem | None:
+def _parse_article(article: ET.Element) -> tuple[CollectedItem | None, str | None]:
     medline = article.find("MedlineCitation")
     if medline is None:
-        return None
+        return None, None
 
     pmid_el = medline.find("PMID")
     pmid = pmid_el.text if pmid_el is not None else None
 
     art = medline.find("Article")
     if art is None:
-        return None
+        return None, None
 
     title_el = art.find("ArticleTitle")
     title = "".join(title_el.itertext()).strip() if title_el is not None else ""
@@ -137,12 +162,15 @@ def _parse_article(article: ET.Element) -> CollectedItem | None:
             except Exception:
                 pass
 
-    # DOI
+    # DOI and PMC ID
     doi: str | None = None
+    pmcid: str | None = None
     for id_el in article.findall(".//ArticleId"):
-        if id_el.get("IdType") == "doi":
+        id_type = id_el.get("IdType")
+        if id_type == "doi":
             doi = normalize_doi(id_el.text)
-            break
+        elif id_type == "pmc" and id_el.text:
+            pmcid = id_el.text.strip()
 
     url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else ""
 
@@ -162,4 +190,4 @@ def _parse_article(article: ET.Element) -> CollectedItem | None:
         open_access=None,
         engagement={},
         raw_payload={"pmid": pmid},
-    )
+    ), pmcid
