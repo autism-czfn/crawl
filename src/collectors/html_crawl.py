@@ -142,7 +142,7 @@ async def collect(
     soup = BeautifulSoup(resp.text, "html.parser")
     article_urls = _extract_article_links(
         soup, base_url, allowed_paths, excluded_paths, min_path_segments,
-        positive_url_patterns, negative_url_patterns,
+        positive_url_patterns, negative_url_patterns, child_link_domains,
     )
 
     if not article_urls:
@@ -267,6 +267,7 @@ def _extract_article_links(
     min_path_segments: int = 2,
     positive_url_patterns: list[str] | None = None,
     negative_url_patterns: list[str] | None = None,
+    child_link_domains: list[str] | None = None,
 ) -> list[str]:
     """Find article links on a listing page."""
     base_domain = urlparse(base_url).netloc

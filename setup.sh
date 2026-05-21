@@ -1104,7 +1104,9 @@ check_status() {
         pid=$(cat "$PID_FILE")
         local cmd
         cmd=$(ps -p "$pid" -o cmd --no-headers 2>/dev/null | head -1 || echo "n/a")
-        success "Crawler     UP   │ PID $pid │ $cmd"
+        local started
+        started=$(ps -p "$pid" -o lstart --no-headers 2>/dev/null | xargs || echo "n/a")
+        success "Crawler     UP   │ PID $pid │ started: $started │ $cmd"
     else
         warn    "Crawler     DOWN"
     fi
@@ -1115,7 +1117,9 @@ check_status() {
         apid=$(cat "$ADMIN_PID_FILE")
         local acmd
         acmd=$(ps -p "$apid" -o cmd --no-headers 2>/dev/null | head -1 || echo "n/a")
-        success "Django admin UP   │ PID $apid │ $acmd"
+        local astarted
+        astarted=$(ps -p "$apid" -o lstart --no-headers 2>/dev/null | xargs || echo "n/a")
+        success "Django admin UP   │ PID $apid │ started: $astarted │ $acmd"
     else
         warn    "Django admin DOWN"
     fi

@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 # Keep batches small to avoid OOM on ≤8 GB machines.
 # fastembed + 100 long chunks can spike to ~7 GB; 20 keeps peak well under 2 GB.
 _BATCH_SIZE = 20
-_CHUNK_BATCH_SIZE = 10        # chunks are longer text than item titles — use smaller batches
-_MAX_PER_RUN = 200            # reduced from 500; more frequent smaller passes are safer
+_CHUNK_BATCH_SIZE = 5         # chunks are longer text — keep very small to avoid OOM on 7.4 GB host
+_MAX_PER_RUN = 50             # reduced from 100; shorter runs = less chance of OOM from concurrent pressure
 _INTERVAL_SEC = 900  # 15 minutes
 
 
@@ -91,7 +91,12 @@ async def run_once(max_items: int = _MAX_PER_RUN) -> int:
 
 
 async def run_loop() -> None:
-    """Long-running loop that calls run_once every 15 minutes."""
+    """Long-running loop that calls run_once every 15 minutes (in-process).
+
+    Prefer subprocess_embedding_loop() on memory-constrained hosts — it spawns
+    a fresh process each run so the ONNX model memory is fully released between
+    passes instead of staying resident for the life of the crawler.
+    """
     logger.info("Embedding loop started (interval=%ds)", _INTERVAL_SEC)
     while True:
         try:
@@ -104,6 +109,90 @@ async def run_loop() -> None:
                 logger.info("Chunk embedding run complete: %d chunks embedded", chunk_count)
         except Exception as exc:
             logger.error("Embedding loop error: %s", exc, exc_info=True)
+        await asyncio.sleep(_INTERVAL_SEC)
+
+
+_MIN_FREE_MB = 4096  # require 4 GB free RAM before spawning embed_worker
+_RAM_RETRY_SEC = 120  # wait 2 min and re-check if RAM is insufficient
+
+
+def _free_ram_mb() -> int:
+    """Return available RAM in MB (MemAvailable from /proc/meminfo)."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return 9999  # assume plenty if we can't read
+
+
+async def subprocess_embedding_loop() -> None:
+    """Spawn embed_worker as a subprocess every 15 minutes.
+
+    Each run gets a fresh Python process: FastEmbed + ONNX runtime load, embed,
+    then exit — fully reclaiming model memory between passes.  The main crawler
+    process stays lean (no model weights in its heap).
+
+    stdout/stderr from the worker are forwarded to the crawler's logger so they
+    appear in crawler.log alongside the rest of the service output.
+
+    Before spawning, checks that at least _MIN_FREE_MB (4 GB) of RAM is
+    available.  If not, waits _RAM_RETRY_SEC (2 min) and retries — this
+    prevents the OOM killer from immediately killing the worker process.
+    """
+    import sys
+
+    logger.info(
+        "Subprocess embedding loop started (interval=%ds) — "
+        "model memory released between runs",
+        _INTERVAL_SEC,
+    )
+    # Brief startup delay: let the scheduler seed surfaces before the first
+    # embedding pass so the worker finds items to embed immediately.
+    await asyncio.sleep(30)
+
+    while True:
+        # Gate on available RAM before spawning — the nomic-embed model loads
+        # ~4-6 GB into the worker process. On a 7.4 GB host with only ~150 MB
+        # free, the OOM killer will immediately SIGKILL the worker (exit -9).
+        free_mb = _free_ram_mb()
+        if free_mb < _MIN_FREE_MB:
+            logger.warning(
+                "embed_worker skipped: only %d MB free RAM (need %d MB); "
+                "retrying in %ds",
+                free_mb, _MIN_FREE_MB, _RAM_RETRY_SEC,
+            )
+            await asyncio.sleep(_RAM_RETRY_SEC)
+            continue
+
+        logger.info("Spawning embed_worker subprocess (free RAM: %d MB) …", free_mb)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "src.embed_worker",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,  # merge stderr into stdout
+            )
+            stdout, _ = await proc.communicate()  # wait for worker to finish
+            for line in (stdout or b"").decode(errors="replace").splitlines():
+                if line.strip():
+                    logger.info("[embed_worker] %s", line)
+            if proc.returncode == -9:
+                logger.error(
+                    "embed_worker OOM-killed by kernel (SIGKILL -9); "
+                    "free RAM was %d MB — will wait %ds before next attempt",
+                    free_mb, _INTERVAL_SEC,
+                )
+            elif proc.returncode != 0:
+                logger.error(
+                    "embed_worker exited with non-zero code %d", proc.returncode
+                )
+            else:
+                logger.info("embed_worker subprocess finished cleanly (model memory released)")
+        except Exception as exc:
+            logger.error("Failed to spawn embed_worker: %s", exc, exc_info=True)
+
         await asyncio.sleep(_INTERVAL_SEC)
 
 

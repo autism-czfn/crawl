@@ -2,7 +2,7 @@ import asyncio
 import logging
 from src.config import settings
 from src.chunk_pipeline import run_loop as chunk_loop
-from src.embeddings import run_loop as embedding_loop
+from src.embeddings import subprocess_embedding_loop as embedding_loop
 from src.pipeline import enrich_fulltext_loop
 from src.scheduler import Scheduler, log_health_metrics
 

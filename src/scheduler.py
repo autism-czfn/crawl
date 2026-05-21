@@ -6,6 +6,7 @@ import importlib
 import json
 import logging
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -51,7 +52,7 @@ _STALENESS_CHECK_INTERVAL = 3600   # check staleness once per hour
 # Playwright launches a full Chromium subprocess (~700 MB–1 GB RSS each).
 # Cap concurrent playwright_crawl runs to prevent OOM when many surfaces are due
 # simultaneously (e.g. first run after a config change, or after 24-hour poll fires).
-_PLAYWRIGHT_CONCURRENCY = 2
+_PLAYWRIGHT_CONCURRENCY = 1  # reduced from 2; each Chromium uses ~700 MB on 7.4 GB host
 _playwright_semaphore: asyncio.Semaphore | None = None
 
 
@@ -207,7 +208,7 @@ class Scheduler:
 
             except Exception as exc:
                 await session.rollback()
-                logger.error("Surface %s failed: %s", surface_key, exc)
+                logger.error("Surface %s failed: %s\n%s", surface_key, exc, traceback.format_exc())
                 await session.execute(
                     update(Surface)
                     .where(Surface.key == surface_key)

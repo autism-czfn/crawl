@@ -154,23 +154,33 @@ async def _find_near_duplicate(
     if not fingerprint or len(fingerprint) < 10:
         return None
     try:
-        # Find items with overlapping fingerprints using JSONB containment
-        # This is approximate: check if at least 5 shingles from our fingerprint
-        # appear in existing items' fingerprints
-        # Use a simpler approach: check content_hash first, then sample fingerprints
-        sample = fingerprint[:10]  # check top 10 shingles
-        result = await session.execute(
-            text("""
-                SELECT url, content_fingerprint
-                FROM crawled_items
-                WHERE url != :url
-                  AND content_fingerprint IS NOT NULL
-                  AND content_fingerprint ?| :sample::text[]
-                LIMIT 5
-            """),
-            {"url": url, "sample": sample},
-        )
-        rows = result.fetchall()
+        # Wrap in a savepoint so that any DB error (e.g. type mismatch, operator
+        # issue) only rolls back this nested transaction — NOT the outer batch.
+        # Without this, a failed query here would put the asyncpg connection into
+        # "InFailedSQLTransactionError" state and cause every subsequent INSERT to
+        # fail until the outer transaction is rolled back.
+        async with session.begin_nested():
+            sample = fingerprint[:10]  # check top 10 shingles
+            # Use jsonb_array_elements_text + ANY to avoid the ?| operator.
+            # The ?| / ?& JSONB operators conflict with SQLAlchemy/asyncpg
+            # parameter handling (? is treated as a positional placeholder),
+            # causing the query to fail and abort the outer transaction.
+            result = await session.execute(
+                text("""
+                    SELECT url, content_fingerprint
+                    FROM crawled_items
+                    WHERE url != :url
+                      AND content_fingerprint IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements_text(content_fingerprint) AS elem
+                          WHERE elem = ANY(:sample::text[])
+                      )
+                    LIMIT 5
+                """),
+                {"url": url, "sample": sample},
+            )
+            rows = result.fetchall()
         for dup_url, dup_fp in rows:
             if isinstance(dup_fp, list):
                 overlap = len(set(fingerprint) & set(dup_fp))
@@ -196,6 +206,14 @@ async def save_items(
         return 0
 
     surface = await session.get(Surface, surface_key)
+
+    # Extract surface attributes into locals BEFORE the loop.
+    # session.rollback() (called on IntegrityError) expires all ORM objects, so
+    # accessing surface.xxx inside the loop after a rollback would trigger a
+    # synchronous lazy-load in an async context → MissingGreenlet crash.
+    _source_type: str | None = surface.source_type if surface else None
+    _authority_tier: int | None = surface.authority_tier if surface else None
+    _audience_type: str | None = surface.audience_type if surface else None
 
     inserted = 0
     for item in items:
@@ -224,7 +242,7 @@ async def save_items(
             content_body = None
 
         content_hash = _hash_content(content_body)
-        source_type = surface.source_type if surface else None
+        source_type = _source_type
 
         # P2-A: language detection
         lang = _detect_lang(content_body or item.get("title"))
@@ -267,9 +285,9 @@ async def save_items(
             "doi": item.get("doi"),
             "journal": item.get("journal"),
             "open_access": item.get("open_access"),
-            "authority_tier": surface.authority_tier if surface else None,
+            "authority_tier": _authority_tier,
             "source_type": source_type,
-            "audience_type": surface.audience_type if surface else None,
+            "audience_type": _audience_type,
             "content_hash": content_hash,
             "content_updated_at": datetime.now(tz=timezone.utc) if content_body else None,
             "raw_payload": item.get("raw_payload") or {},
