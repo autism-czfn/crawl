@@ -26,7 +26,7 @@ LOG_FILE="$PROJECT_DIR/crawler.log"
 ADMIN_LOG_FILE="$PROJECT_DIR/admin.log"
 ADMIN_PORT="${ADMIN_PORT:-8001}"
 PYTHON="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}"
-PYTHON="${PYTHON:-$(command -v python)}"
+PYTHON="${PYTHON:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null)}"
 
 # ── Checks ─────────────────────────────────────────────────────────────────────
 check_python() {
@@ -72,7 +72,7 @@ update_csrf_origins() {
     local origins="https://${public_ip},http://127.0.0.1,http://localhost"
 
     if grep -q "^DJANGO_CSRF_TRUSTED_ORIGINS=" .env; then
-        sed -i "s|^DJANGO_CSRF_TRUSTED_ORIGINS=.*|DJANGO_CSRF_TRUSTED_ORIGINS=${origins}|" .env
+        sed -i '' "s|^DJANGO_CSRF_TRUSTED_ORIGINS=.*|DJANGO_CSRF_TRUSTED_ORIGINS=${origins}|" .env
     else
         echo "DJANGO_CSRF_TRUSTED_ORIGINS=${origins}" >> .env
     fi
@@ -100,7 +100,7 @@ ADMIN_PGREP_PATTERN="admin_site/manage[.]py.*runserver"
 # Matching " -m src.main" (with space, without a colon suffix) avoids false
 # positives from uvicorn apps whose module path also contains "src.main:app".
 _find_crawler_pid() {
-    ps -eo pid,cmd --no-headers 2>/dev/null \
+    ps -eo pid=,command= 2>/dev/null \
         | awk '$2 ~ /python/ && / -m src[.]main( |$)/ {print $1}' \
         | head -1
 }
@@ -110,7 +110,7 @@ _find_crawler_pid() {
 # Killing the parent takes down both; killing only the child causes the parent
 # to immediately respawn it.  sort -n gives lowest PID = the parent.
 _find_admin_pid() {
-    ps -eo pid,cmd --no-headers 2>/dev/null \
+    ps -eo pid=,command= 2>/dev/null \
         | awk '$2 ~ /python/ && /admin_site\/manage[.]py/ && /runserver/ {print $1}' \
         | sort -n \
         | head -1
@@ -124,7 +124,7 @@ is_running() {
         pid=$(cat "$PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
             # Validate: the stored PID must be a python -m src.main process.
-            if ps -p "$pid" -o cmd --no-headers 2>/dev/null \
+            if ps -p "$pid" -o command= 2>/dev/null \
                | awk '$1 ~ /python/ && / -m src[.]main( |$)/ {found=1} END {exit !found}'; then
                 return 0   # running, PID file is valid
             fi
@@ -224,7 +224,7 @@ start_restart_all() {
     sleep 2
     if kill -0 "$admin_pid" 2>/dev/null; then
         local public_ip
-        public_ip=$(grep "^DJANGO_CSRF_TRUSTED_ORIGINS=" .env | grep -oP 'https://\K[^,]+' | head -1)
+        public_ip=$(grep "^DJANGO_CSRF_TRUSTED_ORIGINS=" .env | sed 's/.*https:\/\/\([^,]*\).*/\1/' | head -1)
         success "Django admin started  (PID $admin_pid)  →  https://${public_ip}/admin/"
     else
         error "Django admin exited immediately. Check logs:"
@@ -254,7 +254,7 @@ is_admin_running() {
         local pid
         pid=$(cat "$ADMIN_PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
-            if ps -p "$pid" -o cmd --no-headers 2>/dev/null \
+            if ps -p "$pid" -o command= 2>/dev/null \
                | awk '$1 ~ /python/ && /admin_site\/manage[.]py/ && /runserver/ {found=1} END {exit !found}'; then
                 return 0
             fi
@@ -1103,9 +1103,9 @@ check_status() {
         local pid
         pid=$(cat "$PID_FILE")
         local cmd
-        cmd=$(ps -p "$pid" -o cmd --no-headers 2>/dev/null | head -1 || echo "n/a")
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null | head -1 || echo "n/a")
         local started
-        started=$(ps -p "$pid" -o lstart --no-headers 2>/dev/null | xargs || echo "n/a")
+        started=$(ps -p "$pid" -o lstart= 2>/dev/null | xargs || echo "n/a")
         success "Crawler     UP   │ PID $pid │ started: $started │ $cmd"
     else
         warn    "Crawler     DOWN"
@@ -1116,9 +1116,9 @@ check_status() {
         local apid
         apid=$(cat "$ADMIN_PID_FILE")
         local acmd
-        acmd=$(ps -p "$apid" -o cmd --no-headers 2>/dev/null | head -1 || echo "n/a")
+        acmd=$(ps -p "$apid" -o command= 2>/dev/null | head -1 || echo "n/a")
         local astarted
-        astarted=$(ps -p "$apid" -o lstart --no-headers 2>/dev/null | xargs || echo "n/a")
+        astarted=$(ps -p "$apid" -o lstart= 2>/dev/null | xargs || echo "n/a")
         success "Django admin UP   │ PID $apid │ started: $astarted │ $acmd"
     else
         warn    "Django admin DOWN"

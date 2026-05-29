@@ -16,6 +16,7 @@ playwright>=1.44.0
 trafilatura>=1.6
 pdfplumber>=0.10
 youtube-transcript-api>=0.6
+yt-dlp>=2024.1.0
 
 # Django admin site
 django>=4.2.0
