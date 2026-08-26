@@ -722,8 +722,11 @@ try:
         print(f"  {DIM}\"Awaiting OA-check\" = has a DOI, hasn't been asked to Unpaywall yet "
               f"(runs in batches of 300 every 30 min).{RESET}")
         print(f"  {DIM}\"Awaiting fulltext\" = Unpaywall already gave us a real download URL, "
-              f"but the actual fetch+extract hasn't happened yet (runs in batches of 100 "
-              f"every 30 min) — this is the queue that turns into real full articles next.{RESET}")
+              f"but the actual fetch+extract hasn't happened yet (runs in batches of 300 "
+              f"every 30 min). This does NOT mean these will become real articles — most "
+              f"turn out paywalled/bot-blocked (mdpi.com, wiley, sagepub, sciencedirect, "
+              f"tandfonline, etc. routinely 403 us) and get marked as confirmed dead ends "
+              f"instead. This number just means \"gets a final answer next,\" not \"will succeed.\"{RESET}")
         print()
 
     cur.close()

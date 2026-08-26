@@ -214,7 +214,15 @@ class RateLimitedClient:
                     if resp.status_code == 403:
                         breaker.record_failure()
                         logger.error("403 BLOCKED on %s", domain)
-                        raise PermissionError(f"403 on {url}")
+                        # resp.url is the FINAL URL after any redirects (e.g.
+                        # doi.org -> the actual publisher) — attach it so
+                        # callers that attribute blame per-domain (see
+                        # src/pipeline.py's blocked_domains tracking) can
+                        # blame the site that actually 403'd, not the
+                        # redirector that merely forwarded the request there.
+                        exc = PermissionError(f"403 on {url}")
+                        exc.final_url = str(resp.url)
+                        raise exc
 
                     if resp.status_code == 404:
                         raise FileNotFoundError(f"404 on {url}")

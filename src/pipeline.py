@@ -540,18 +540,98 @@ async def enrich_unpaywall(session: AsyncSession, batch_size: int = 300) -> int:
     return updated
 
 
-async def enrich_fulltext(session: AsyncSession, batch_size: int = 100) -> int:
+_pdf_pool = None  # lazy singleton — see _get_pdf_pool()
+
+
+def _get_pdf_pool():
+    """Return the shared PDF-parsing process pool, creating it on first use.
+
+    Deliberately lazy (not created at module import time): importing
+    src.pipeline happens from tests, admin tooling, and migrations too —
+    none of those need 4 worker processes spawned just because the module
+    was imported. Created once and reused across every enrich_fulltext()
+    call for the life of the crawler process (unlike embed_worker, which is
+    deliberately a fresh subprocess per run to release ML-model memory —
+    these workers are lightweight and should stay warm; respawning a
+    process pool every 30 min would just add startup overhead for nothing).
+
+    Sized at 4 workers on this machine's 8 cores — not 8 — to leave real
+    headroom for the scheduler's concurrent surface collectors,
+    chunk_pipeline, and the embed_worker subprocess. See crawl.txt section 14.
+    """
+    global _pdf_pool
+    if _pdf_pool is None:
+        from concurrent.futures import ProcessPoolExecutor
+        _pdf_pool = ProcessPoolExecutor(max_workers=4)
+    return _pdf_pool
+
+
+def _parse_html_body(html_text: str) -> str | None:
+    """Run in a worker thread — BeautifulSoup + extract_body for one page.
+
+    Cheap enough per-item (unlike multi-page PDF parsing) that a thread is
+    sufficient here; no need to burn a process-pool slot on it too.
+    """
+    from bs4 import BeautifulSoup
+    from src.extractors.html import extract_body
+    return extract_body(BeautifulSoup(html_text, "html.parser"))
+
+
+_GIVE_UP_403_THRESHOLD = 5  # matches src/http/client.py's CircuitBreaker.threshold
+
+
+def _domain_of(url: str) -> str:
+    """Same normalization as src/http/client.py's _domain() — strip a leading
+    'www.' so 'www.mdpi.com' and 'mdpi.com' are tracked as the same domain."""
+    from urllib.parse import urlparse
+    netloc = urlparse(url).netloc
+    return netloc[4:] if netloc.startswith("www.") else netloc
+
+
+class _DomainGivenUp(Exception):
+    """Raised by _fetch() instead of making a request, when the domain has
+    already crossed _GIVE_UP_403_THRESHOLD consecutive 403s across past
+    enrich_fulltext() cycles (see blocked_domains table / migration 0021).
+    Distinguished from a real fetch failure so stage 3 writes the ''
+    permanent-failure sentinel immediately instead of leaving NULL (which
+    would just retry — and re-fail — forever)."""
+
+
+async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
     """Fetch full text for open-access records that have an oa_url.
 
-    Phase 1: HTML URLs only. PDF URLs are deferred (logged + skipped) until
-    P3-A PDF extractor is available.
+    Three stages, run across the whole batch instead of one row at a time:
+      1. DOWNLOAD (I/O-bound) — fetch every URL in the batch concurrently.
+         Cheap on CPU; the existing per-domain semaphore in
+         src/http/client.py already caps concurrency to any one site, so
+         doing all of these at once doesn't need to change anything there.
+      2. PARSE (CPU-bound) — PDFs go to a process pool (real multi-core
+         parallelism, since pdfplumber parsing doesn't release the GIL);
+         HTML pages go to a thread (cheap enough, no need for a process
+         slot). Both run concurrently with each other and with stage 1's
+         tail end.
+      3. WRITE — a single sequential pass over the results, applying the
+         same permanent-failure-sentinel rules as before (store '' for a
+         definitive rejection so it's never re-fetched; leave NULL on a
+         transient fetch error so it's retried next cycle). AsyncSession
+         isn't safe for concurrent use, so this stage is intentionally
+         sequential even though 1 and 2 are not.
+
+    See crawl.txt section 14 for the full design writeup.
     """
+    import asyncio
     from src.http.client import get_shared_client
-    from src.extractors.html import extract_body
-    from bs4 import BeautifulSoup
+    from src.extractors.pdf import extract_text_from_pdf
+    from src.storage.models import BlockedDomain
 
     client = get_shared_client()
     enriched = 0
+
+    given_up_domains = set(
+        (await session.execute(
+            select(BlockedDomain.domain).where(BlockedDomain.given_up.is_(True))
+        )).scalars().all()
+    )
 
     _priority = case(
         (cast(CrawledItem.domain_tags, String).ilike("%sleep%"), 0),
@@ -568,80 +648,195 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 100) -> int:
         .limit(batch_size)
     )
     rows = result.fetchall()
+    if not rows:
+        return 0
 
-    for row_id, oa_url in rows:
-        # PDF detection
-        is_pdf = (
-            oa_url.lower().endswith(".pdf") or
-            "pdf" in oa_url.lower()
-        )
-        if is_pdf:
-            try:
-                from src.extractors.pdf import extract_text_from_pdf
-                resp = await client.get(oa_url)
-                if "application/pdf" in resp.headers.get("content-type", ""):
-                    extracted = extract_text_from_pdf(resp.content)
-                    # extracted is None only when pdfplumber raised while parsing
-                    # this exact PDF (locked/corrupt) — the same bytes will fail
-                    # the same way every time, so treat it as permanent too and
-                    # store '' instead of leaving NULL (which re-downloads and
-                    # re-parses this same doomed PDF every 6h cycle forever).
-                    await session.execute(
-                        update(CrawledItem)
-                        .where(CrawledItem.id == row_id)
-                        .values(content_body=extracted or "")
-                    )
-                    if extracted:
-                        enriched += 1
-                    continue
-                # Fall through to HTML extraction if content-type not PDF
-            except ImportError:
-                logger.info("enrich_fulltext: PDF oa_url deferred (pdfplumber not installed): %s", oa_url)
-                continue
-            except Exception as exc:
-                logger.debug("enrich_fulltext: PDF fetch failed for %s: %s", oa_url, exc)
-                continue
-
-        # HTML fetch
+    # ── Stage 1: concurrent download ──────────────────────────────────────
+    async def _fetch(row_id, oa_url):
+        if _domain_of(oa_url) in given_up_domains:
+            return (row_id, oa_url, None, _DomainGivenUp(_domain_of(oa_url)))
         try:
             resp = await client.get(oa_url, use_browser_ua=True)
-            soup = BeautifulSoup(resp.text, "html.parser")
-            body = extract_body(soup)
-
-            # Quality gate for paywall masquerading as OA. These are definitive,
-            # page-structure-level verdicts (not a transient network hiccup), so
-            # persist '' as a permanent-failure sentinel — same convention as the
-            # PDF branch above. Without this, a page that will never pass the
-            # gate gets re-fetched and re-rejected every single 6h cycle forever,
-            # burning batch slots that should go to unfetched records.
-            if body is None:
-                logger.debug("enrich_fulltext: empty/low-quality body at %s", oa_url)
-                await session.execute(
-                    update(CrawledItem).where(CrawledItem.id == row_id).values(content_body="")
-                )
-                continue
-
-            paywall_signals = [
-                "sign in", "log in", "create account", "access denied", "subscribe to read"
-            ]
-            body_lower = body.lower()
-            if len(body) < 300 or any(s in body_lower for s in paywall_signals):
-                logger.debug("enrich_fulltext: paywall detected at %s — discarding", oa_url)
-                await session.execute(
-                    update(CrawledItem).where(CrawledItem.id == row_id).values(content_body="")
-                )
-                continue
-
-            await session.execute(
-                update(CrawledItem)
-                .where(CrawledItem.id == row_id)
-                .values(content_body=body)
-            )
-            enriched += 1
-
+            return (row_id, oa_url, resp, None)
         except Exception as exc:
-            logger.debug("enrich_fulltext: fetch failed for %s: %s", oa_url, exc)
+            return (row_id, oa_url, None, exc)
+
+    fetched = await asyncio.gather(*(_fetch(rid, url) for rid, url in rows))
+
+    # ── Track consecutive 403s per domain, across this batch AND prior
+    #    cycles (the counter is persisted in blocked_domains) ──────────────
+    # A domain that already got 5+ 403s in a row here has almost certainly
+    # got an active anti-bot WAF (Cloudflare/Akamai/etc — confirmed durable
+    # even against a real browser for a comparable domain, see chop_adhd's
+    # content_notes) rather than a transient blip, so give up on it for good
+    # instead of re-attempting it, and everything on it, every cycle forever.
+    # Attribute by the FINAL url (after any redirects), not the requested
+    # oa_url — many oa_urls are doi.org resolver links that redirect to the
+    # actual publisher; blaming doi.org for a 403 that really came from
+    # whatever it redirected to would give up on the shared front door for
+    # EVERY publisher's DOIs, including ones that were never blocking us at
+    # all. src/http/client.py attaches final_url to the exception for this.
+    domain_403_count: dict[str, int] = {}
+    domain_succeeded: set[str] = set()
+    for row_id, oa_url, resp, fetch_exc in fetched:
+        if isinstance(fetch_exc, PermissionError) and "403" in str(fetch_exc):
+            domain = _domain_of(getattr(fetch_exc, "final_url", None) or oa_url)
+            domain_403_count[domain] = domain_403_count.get(domain, 0) + 1
+        elif resp is not None:
+            domain_succeeded.add(_domain_of(str(resp.url)))
+
+    newly_given_up: set[str] = set()
+    for domain in set(domain_403_count) | domain_succeeded:
+        if domain in domain_succeeded:
+            new_count = 0
+        else:
+            existing = (await session.execute(
+                select(BlockedDomain.consecutive_403_count).where(BlockedDomain.domain == domain)
+            )).scalar_one_or_none() or 0
+            new_count = existing + domain_403_count.get(domain, 0)
+        will_give_up = new_count >= _GIVE_UP_403_THRESHOLD
+        stmt = insert(BlockedDomain).values(
+            domain=domain,
+            consecutive_403_count=new_count,
+            given_up=will_give_up,
+            given_up_at=datetime.now(tz=timezone.utc) if will_give_up else None,
+            last_checked_at=datetime.now(tz=timezone.utc),
+        ).on_conflict_do_update(
+            index_elements=["domain"],
+            set_={
+                "consecutive_403_count": new_count,
+                "given_up": will_give_up,
+                "given_up_at": datetime.now(tz=timezone.utc) if will_give_up else None,
+                "last_checked_at": datetime.now(tz=timezone.utc),
+            },
+        )
+        await session.execute(stmt)
+        if will_give_up and domain not in given_up_domains:
+            newly_given_up.add(domain)
+    if newly_given_up:
+        logger.warning(
+            "enrich_fulltext: giving up on domain(s) after %d+ consecutive 403s: %s",
+            _GIVE_UP_403_THRESHOLD, sorted(newly_given_up),
+        )
+
+    # ── Stage 2: concurrent parse — PDFs on the process pool, HTML on threads ──
+    loop = asyncio.get_running_loop()
+    pdf_pool = _get_pdf_pool()
+    parse_futures = []
+    for row_id, oa_url, resp, fetch_exc in fetched:
+        if resp is None:
+            parse_futures.append(None)  # fetch failed — nothing to parse
             continue
+        is_pdf = "application/pdf" in resp.headers.get("content-type", "")
+        if is_pdf:
+            parse_futures.append(
+                loop.run_in_executor(pdf_pool, extract_text_from_pdf, resp.content)
+            )
+        else:
+            parse_futures.append(asyncio.to_thread(_parse_html_body, resp.text))
+
+    # Gather only the real futures, preserving position via a placeholder pass.
+    real_futures = [f for f in parse_futures if f is not None]
+    real_results = iter(
+        await asyncio.gather(*real_futures, return_exceptions=True) if real_futures else []
+    )
+    parsed = [None if f is None else next(real_results) for f in parse_futures]
+
+    async def _write(row_id, content_body_value):
+        """Execute one UPDATE inside its own SAVEPOINT, isolated so a single
+        bad row (e.g. a NUL byte from a PDF ligature mis-decode — Postgres's
+        UTF8 text columns reject \\x00 outright) can't poison the whole
+        session and silently wipe out every other write in this batch.
+
+        Deliberately a SAVEPOINT (session.begin_nested()), NOT a plain
+        session.rollback() — this whole batch shares one outer transaction
+        that only gets commit()-ed once at the end, so a bare rollback()
+        would discard every OTHER item's already-written update too, not
+        just this failed one. A SAVEPOINT only undoes back to itself.
+
+        Without this, one DBAPIError here would leave the AsyncSession in a
+        failed-transaction state for the rest of the loop AND prevent the
+        final commit() from ever running — the exact same failure mode
+        already seen in the clinicaltrials_* surfaces (see earlier fix).
+        batch_size=300 makes hitting this kind of row far more likely per
+        cycle than it used to be at 100.
+        """
+        try:
+            async with session.begin_nested():
+                await session.execute(
+                    update(CrawledItem).where(CrawledItem.id == row_id).values(content_body=content_body_value)
+                )
+        except Exception as exc:
+            logger.warning("enrich_fulltext: write failed for row %s, skipping just this row: %s", row_id, exc)
+
+    def _sanitize(text: str | None) -> str | None:
+        """Strip NUL bytes — Postgres UTF8 text columns reject them outright
+        (CharacterNotInRepertoireError), and pdfplumber occasionally emits one
+        in place of an unrecognized ligature (e.g. the "fl" in "influence").
+        """
+        return text.replace("\x00", "") if text else text
+
+    # ── Stage 3: sequential write — same rules as before, just reordered ──
+    for (row_id, oa_url, resp, fetch_exc), parse_result in zip(fetched, parsed):
+        if resp is None:
+            # _DomainGivenUp is raised pre-fetch against the REQUESTED
+            # domain (we never got far enough to see a redirect); a 403
+            # this batch is checked against the FINAL domain (post-redirect)
+            # to match how it was tallied above — see the attribution note
+            # a few lines up.
+            final_domain = _domain_of(getattr(fetch_exc, "final_url", None) or oa_url)
+            # Domain already given up before this batch, OR just crossed the
+            # threshold from 403s seen earlier IN this same batch — either
+            # way, this is now a permanent verdict, not a transient failure:
+            # write '' so it stops occupying a queue slot, instead of NULL
+            # (which would just retry — and re-fail — every future cycle).
+            if isinstance(fetch_exc, _DomainGivenUp) or final_domain in newly_given_up:
+                await _write(row_id, "")
+                continue
+            logger.debug("enrich_fulltext: fetch failed for %s: %s", oa_url, fetch_exc)
+            continue  # transient — leave NULL, retry next cycle
+
+        is_pdf = "application/pdf" in resp.headers.get("content-type", "")
+
+        if isinstance(parse_result, Exception):
+            logger.debug("enrich_fulltext: parse raised for %s: %s", oa_url, parse_result)
+            continue  # transient/unexpected — leave NULL, retry next cycle
+
+        if is_pdf:
+            extracted = _sanitize(parse_result)
+            # extracted is None only when pdfplumber raised while parsing this
+            # exact PDF (locked/corrupt) — the same bytes will fail the same
+            # way every time, so treat it as permanent too and store ''
+            # instead of leaving NULL (which would re-download and re-parse
+            # this same doomed PDF every cycle forever).
+            await _write(row_id, extracted or "")
+            if extracted:
+                enriched += 1
+            continue
+
+        # HTML — quality gate for paywall masquerading as OA. These are
+        # definitive, page-structure-level verdicts (not a transient network
+        # hiccup), so persist '' as a permanent-failure sentinel — same
+        # convention as the PDF branch above. Without this, a page that will
+        # never pass the gate gets re-fetched and re-rejected every cycle
+        # forever, burning batch slots that should go to unfetched records.
+        body = _sanitize(parse_result)
+        if body is None:
+            logger.debug("enrich_fulltext: empty/low-quality body at %s", oa_url)
+            await _write(row_id, "")
+            continue
+
+        paywall_signals = [
+            "sign in", "log in", "create account", "access denied", "subscribe to read"
+        ]
+        body_lower = body.lower()
+        if len(body) < 300 or any(s in body_lower for s in paywall_signals):
+            logger.debug("enrich_fulltext: paywall detected at %s — discarding", oa_url)
+            await _write(row_id, "")
+            continue
+
+        await _write(row_id, body)
+        enriched += 1
 
     await session.commit()
     return enriched

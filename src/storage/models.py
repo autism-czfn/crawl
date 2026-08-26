@@ -145,3 +145,15 @@ class HttpCache(Base):
     etag = Column(Text, nullable=True)
     last_modified = Column(Text, nullable=True)
     expires_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class BlockedDomain(Base):
+    """Durable per-domain "give up" tracking for enrich_fulltext() — see
+    migration 0021_add_blocked_domains for the rationale."""
+    __tablename__ = "blocked_domains"
+
+    domain = Column(Text, primary_key=True)
+    consecutive_403_count = Column(Integer, nullable=False, default=0)
+    given_up = Column(Boolean, nullable=False, default=False)
+    given_up_at = Column(DateTime(timezone=True), nullable=True)
+    last_checked_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
