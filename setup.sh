@@ -552,6 +552,190 @@ except Exception as e:
 PYEOF
 }
 
+# ── Option 10 — Show crawled full articles by track ───────────────────────────
+show_track_stats() {
+    echo
+    info "=== Crawled Full Articles by Track (Tier 1 & Tier 2) ==="
+    echo
+
+    if [[ ! -f .env ]]; then
+        error ".env not found — cannot determine DATABASE_URL."
+        echo; return
+    fi
+
+    "$PYTHON" - << 'PYEOF'
+import os, sys, pathlib, re
+
+# ── Load .env ──
+for line in pathlib.Path(".env").read_text().splitlines():
+    line = line.strip()
+    if line and not line.startswith("#") and "=" in line:
+        k, _, v = line.partition("=")
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+db_url = os.environ.get("DATABASE_URL", "")
+if not db_url:
+    print("  \033[0;31m[ERROR]\033[0m  DATABASE_URL not set in .env")
+    sys.exit(1)
+
+db_url = re.sub(r"^(postgresql)\+\w+://", r"\1://", db_url)
+
+BOLD  = "\033[1m"
+DIM   = "\033[2m"
+GREEN = "\033[0;32m"
+CYAN  = "\033[0;36m"
+WARN  = "\033[1;33m"
+RESET = "\033[0m"
+
+# "Full article" threshold matches show_db_stats (option 7): content_body
+# >= 1000 chars. Below that (but not NULL) is treated as abstract-only —
+# typical of academic-API sources before Unpaywall enrichment lands real
+# full text (see src/pipeline.py enrich_unpaywall/enrich_fulltext).
+FULL_TEXT_MIN_LEN = 1000
+
+def bar(n, total, width=20):
+    if total == 0:
+        return "[" + "-" * width + "]"
+    filled = int(round(n / total * width))
+    return "[" + "█" * filled + "─" * (width - filled) + "]"
+
+def pct(n, total):
+    return f"{n/total*100:.0f}%" if total else "─"
+
+try:
+    import psycopg2
+    conn = psycopg2.connect(db_url)
+    cur  = conn.cursor()
+
+    # A track/domain_tag is unnested from the domain_tags jsonb array, same
+    # approach as the crawl_domain_tag_coverage view (migration 0020) — an
+    # item tagged ["sleep","eating"] is correctly counted under both, not
+    # just its first tag. Scoped to Tier 1/2 only, matching this project's
+    # standing focus (see crawl.txt).
+    cur.execute(f"""
+        SELECT
+            domain_value AS track,
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE LENGTH(content_body) >= {FULL_TEXT_MIN_LEN}) AS full_text,
+            COUNT(*) FILTER (WHERE content_body IS NOT NULL
+                              AND LENGTH(content_body) < {FULL_TEXT_MIN_LEN}) AS abstract_only,
+            COUNT(*) FILTER (WHERE authority_tier = 1) AS tier1_total,
+            COUNT(*) FILTER (WHERE authority_tier = 1
+                              AND LENGTH(content_body) >= {FULL_TEXT_MIN_LEN}) AS tier1_full,
+            COUNT(*) FILTER (WHERE authority_tier = 2) AS tier2_total,
+            COUNT(*) FILTER (WHERE authority_tier = 2
+                              AND LENGTH(content_body) >= {FULL_TEXT_MIN_LEN}) AS tier2_full
+        FROM crawled_items,
+             LATERAL jsonb_array_elements_text(
+                 COALESCE(domain_tags, '[]'::jsonb)
+             ) AS domain_value
+        WHERE authority_tier IN (1, 2)
+        GROUP BY domain_value
+        ORDER BY total DESC;
+    """)
+    rows = cur.fetchall()
+
+    if not rows:
+        print(f"  {WARN}No Tier 1/2 items with a domain_tags value found.{RESET}")
+    else:
+        print(f"  {BOLD}{'Track':<14} {'Total':>6} {'FullTxt':>7} {'Abstract':>8} "
+              f"{'T1 total':>8} {'T1 full':>7} {'T2 total':>8} {'T2 full':>7}  Coverage{RESET}")
+        print(f"  {'─'*14} {'─'*6} {'─'*7} {'─'*8} {'─'*8} {'─'*7} {'─'*8} {'─'*7}  {'─'*22}")
+
+        sum_total = sum_full = sum_abstract = 0
+        sum_t1_total = sum_t1_full = sum_t2_total = sum_t2_full = 0
+
+        for (track, total, full_text, abstract_only,
+             t1_total, t1_full, t2_total, t2_full) in rows:
+            cov_bar = bar(full_text, total)
+            print(f"  {track:<14} {total:>6,} {full_text:>7,} {abstract_only:>8,} "
+                  f"{t1_total:>8,} {t1_full:>7,} {t2_total:>8,} {t2_full:>7,}  "
+                  f"{cov_bar} {pct(full_text, total):>4}")
+            sum_total      += total
+            sum_full       += full_text
+            sum_abstract   += abstract_only
+            sum_t1_total   += t1_total
+            sum_t1_full    += t1_full
+            sum_t2_total   += t2_total
+            sum_t2_full    += t2_full
+
+        print(f"  {'─'*14} {'─'*6} {'─'*7} {'─'*8} {'─'*8} {'─'*7} {'─'*8} {'─'*7}")
+        print(f"  {BOLD}{'TOTAL':<14} {sum_total:>6,} {sum_full:>7,} {sum_abstract:>8,} "
+              f"{sum_t1_total:>8,} {sum_t1_full:>7,} {sum_t2_total:>8,} {sum_t2_full:>7,}{RESET}")
+
+        print()
+        print(f"  {DIM}\"Total\" counts an item once per track it's tagged with — an "
+              f"item tagged [\"sleep\",\"eating\"] counts under both, so the column "
+              f"(and the TOTAL row below it) doesn't sum to the DB's total row count.{RESET}")
+        print(f"  {DIM}\"FullTxt\" = content_body >= {FULL_TEXT_MIN_LEN} chars. "
+              f"\"Abstract\" = has content_body but shorter (pre-enrichment academic "
+              f"records) or empty-string permanent-failure sentinels.{RESET}")
+        print()
+
+    # ── Unprocessed queue by track (how much backlog is sitting waiting) ──
+    # Two stages, matching src/pipeline.py:
+    #   awaiting_oa_check  — has a DOI, Unpaywall hasn't been asked yet (or
+    #                        was asked and said OA but we still lack a URL)
+    #   awaiting_fulltext  — Unpaywall already gave us a real oa_url, but
+    #                        enrich_fulltext hasn't fetched/parsed it yet
+    cur.execute("""
+        SELECT
+            domain_value AS track,
+            COUNT(*) FILTER (
+                WHERE doi IS NOT NULL
+                  AND (open_access IS NULL
+                       OR (open_access = true AND oa_url IS NULL))
+            ) AS awaiting_oa_check,
+            COUNT(*) FILTER (
+                WHERE open_access = true AND content_body IS NULL
+                  AND doi IS NOT NULL AND oa_url IS NOT NULL
+            ) AS awaiting_fulltext
+        FROM crawled_items,
+             LATERAL jsonb_array_elements_text(
+                 COALESCE(domain_tags, '[]'::jsonb)
+             ) AS domain_value
+        WHERE authority_tier IN (1, 2)
+        GROUP BY domain_value
+        ORDER BY awaiting_fulltext DESC;
+    """)
+    queue_rows = cur.fetchall()
+
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    print(f"  {BOLD}{CYAN}Unprocessed queue by track (how bad is the backlog){RESET}")
+    print(f"  {BOLD}{'─'*70}{RESET}")
+
+    if not queue_rows:
+        print(f"  {WARN}No Tier 1/2 queue data found.{RESET}")
+    else:
+        print(f"  {BOLD}{'Track':<14} {'Awaiting OA-check':>18} {'Awaiting fulltext':>18}{RESET}")
+        print(f"  {'─'*14} {'─'*18} {'─'*18}")
+
+        sum_oa_wait = sum_ft_wait = 0
+        for track, oa_wait, ft_wait in queue_rows:
+            print(f"  {track:<14} {oa_wait:>18,} {ft_wait:>18,}")
+            sum_oa_wait += oa_wait
+            sum_ft_wait += ft_wait
+
+        print(f"  {'─'*14} {'─'*18} {'─'*18}")
+        print(f"  {BOLD}{'TOTAL':<14} {sum_oa_wait:>18,} {sum_ft_wait:>18,}{RESET}")
+        print()
+        print(f"  {DIM}\"Awaiting OA-check\" = has a DOI, hasn't been asked to Unpaywall yet "
+              f"(runs in batches of 300 every 30 min).{RESET}")
+        print(f"  {DIM}\"Awaiting fulltext\" = Unpaywall already gave us a real download URL, "
+              f"but the actual fetch+extract hasn't happened yet (runs in batches of 100 "
+              f"every 30 min) — this is the queue that turns into real full articles next.{RESET}")
+        print()
+
+    cur.close()
+    conn.close()
+
+except Exception as e:
+    import traceback
+    print(f"  {WARN}[WARN]{RESET}  DB query failed: {e}")
+    traceback.print_exc()
+PYEOF
+}
+
 # ── Option 8 — Install & initialize PostgreSQL ────────────────────────────────
 step() { echo -e "\n${BOLD}==▶ $*${RESET}"; }
 
@@ -1167,9 +1351,10 @@ print_menu() {
     echo -e "  ${CYAN}7)${RESET} Show DB stats         (size / crawled items / sources)"
     echo -e "  ${GREEN}8)${RESET} Install & initialize PostgreSQL"
     echo -e "  ${CYAN}9)${RESET} Run test suite         (pytest tests/)"
+    echo -e "  ${CYAN}10)${RESET} Show full articles by track (sleep/eating/behavior/...)"
     echo -e "  ${RED}0)${RESET} Exit"
     echo
-    echo -n "  Select an option [0-9]: "
+    echo -n "  Select an option [0-10]: "
 }
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -1189,6 +1374,7 @@ while true; do
         7) show_db_stats     ;;
         8) install_postgres  ;;
         9) run_tests         ;;
+        10) show_track_stats ;;
         0)
             echo
             info "Goodbye."
@@ -1196,7 +1382,7 @@ while true; do
             exit 0
             ;;
         *)
-            error "Invalid option '${choice}'. Please enter 0–9."
+            error "Invalid option '${choice}'. Please enter 0–10."
             ;;
     esac
 done

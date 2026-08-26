@@ -9,7 +9,11 @@ from src.scheduler import Scheduler, log_health_metrics
 # captions.py (yt-dlp based) is disabled — YouTube transcripts are now fetched
 # directly by the YouTube collector via youtube-transcript-api at collection time.
 
-logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL, logging.INFO))
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
 
