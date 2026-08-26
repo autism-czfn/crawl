@@ -1,7 +1,6 @@
 """NHS UK collector: fetches health content via NHS Conditions API or sitemap fallback.
 
 The NHS Content API v2 is a content-delivery API (fetch by slug).
-We use it to retrieve specific conditions pages related to autism.
 Fallback: NHS sitemap (sitemap-cms-content.xml) if API is unavailable.
 
 Usage in surfaces.json:
@@ -10,6 +9,25 @@ Usage in surfaces.json:
     "platform": "nhs_api",
     "config": {
       "base_url": "https://www.nhs.uk/conditions/autism/"
+    }
+  }
+
+Topic slugs are config-driven (config["slugs"]), not hardcoded per topic.
+Each slug is a full path relative to https://www.nhs.uk/ — NOT assumed to
+live under /conditions/, since real nhs.uk content spans multiple
+namespaces (/conditions/, /live-well/, /mental-health/, etc). A surface that
+sets no "slugs" falls back to _DEFAULT_SLUGS below (the original autism
+list, byte-identical to the pre-generalization behavior), so nhs_autism
+needs no config change. Adding a new topic (e.g. nhs_sleep, nhs_eating)
+is then just a new surfaces.json entry with its own "slugs" list — no
+code change required:
+
+  {
+    "key": "nhs_sleep",
+    "platform": "nhs_api",
+    "config": {
+      "slugs": ["conditions/insomnia", "conditions/sleepwalking",
+                "live-well/sleep-and-tiredness/healthy-sleep-tips-for-children"]
     }
   }
 """
@@ -23,33 +41,45 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 from src.collectors.base import CollectedItem
+from src.extractors.html import extract_body as _extract_body_shared
 from src.http.client import get_shared_client
 
 logger = logging.getLogger(__name__)
 
-# NHS autism-related condition slugs to fetch
-_AUTISM_SLUGS = [
-    "autism",
-    "autism/what-is-autism",
-    "autism/signs-of-autism",
-    "autism/getting-diagnosed",
-    "autism/help-and-support",
-    "autism/autism-and-everyday-life",
-    "autism/autism-and-everyday-life/communicating",
-    "autism/autism-and-everyday-life/community-care-and-support",
-    "developmental-delay",
-    "social-care-and-support-guide",
+# Default slugs used when a surface's config sets no "slugs" list — this is
+# the original nhs_autism slug set, with the "/conditions/" prefix now baked
+# in explicitly (it used to be implicit in the URL-join logic below) so
+# behavior is unchanged for the existing nhs_autism surface.
+_DEFAULT_SLUGS = [
+    # Autism condition pages
+    "conditions/autism",
+    "conditions/autism/what-is-autism",
+    "conditions/autism/signs-of-autism",
+    "conditions/autism/getting-diagnosed",
+    "conditions/autism/help-and-support",
+    "conditions/autism/autism-and-everyday-life",
+    "conditions/autism/autism-and-everyday-life/communicating",
+    "conditions/autism/autism-and-everyday-life/community-care-and-support",
+    "conditions/developmental-delay",
+    "conditions/social-care-and-support-guide",
+    # Related conditions that parents search for alongside autism
+    "conditions/attention-deficit-hyperactivity-disorder-adhd",
+    "conditions/sensory-processing-disorder",
+    "conditions/learning-disabilities",
+    "conditions/stammering",
+    "conditions/selective-mutism",
+    "conditions/dyspraxia",
 ]
 
-# Related conditions that parents search for alongside autism
-_RELATED_SLUGS = [
-    "attention-deficit-hyperactivity-disorder-adhd",
-    "sensory-processing-disorder",
-    "learning-disabilities",
-    "stammering",
-    "selective-mutism",
-    "dyspraxia",
-]
+
+def _build_urls(config: dict) -> list[str]:
+    """Build the list of nhs.uk URLs to fetch — each slug relative to nhs.uk
+    root, not assumed to be under /conditions/ (see module docstring). Pulled
+    out as a pure function so URL construction is unit-testable without
+    hitting the network.
+    """
+    slugs: list[str] = config.get("slugs", _DEFAULT_SLUGS)
+    return [f"https://www.nhs.uk/{slug.strip('/')}/" for slug in slugs]
 
 
 async def collect(
@@ -59,15 +89,17 @@ async def collect(
 ) -> tuple[list[CollectedItem], str | None]:
     """
     config keys:
-      base_url: str — base NHS conditions URL (e.g. https://www.nhs.uk/conditions/autism/)
+      base_url: str        — unused for URL construction (kept for
+                              documentation/back-compat); see "slugs" below
+      slugs:    list[str]  — paths relative to https://www.nhs.uk/ to fetch,
+                              e.g. "conditions/insomnia" or
+                              "live-well/sleep-and-tiredness/healthy-sleep-tips-for-children".
+                              Defaults to _DEFAULT_SLUGS (the autism set) if
+                              not provided, so existing surfaces are unaffected.
     cursor: URL of last processed page or None
     """
-    base_url: str = config.get("base_url", "https://www.nhs.uk/conditions/autism/")
     client = get_shared_client()
-
-    # Build list of URLs to fetch
-    all_slugs = _AUTISM_SLUGS + _RELATED_SLUGS
-    urls = [f"https://www.nhs.uk/conditions/{slug}/" for slug in all_slugs]
+    urls = _build_urls(config)
 
     # Skip already-processed URLs
     if cursor and cursor in urls:
@@ -153,26 +185,17 @@ def _extract_page(soup: BeautifulSoup, url: str) -> CollectedItem | None:
 
 
 def _extract_body(soup: BeautifulSoup) -> str | None:
-    """Extract NHS page main content."""
-    work = BeautifulSoup(str(soup), "html.parser")
-    for tag in work.find_all(["nav", "footer", "aside", "header", "script", "style", "noscript"]):
-        tag.decompose()
+    """Extract NHS page main content.
 
-    # NHS uses specific content containers
-    for sel in [
-        "#maincontent",
-        "main",
-        ".nhsuk-main-wrapper",
-        "article",
-        "[role='main']",
-    ]:
-        el = work.select_one(sel)
-        if el:
-            text = el.get_text(" ", strip=True)
-            if len(text) > 100:
-                return _clean_text(text)
-
-    return None
+    Delegates to the shared extractor (Trafilatura first, then a CSS
+    selector fallback list with a proper 300-char/50-word/boilerplate
+    quality gate) instead of a bespoke low-bar selector scan, so NHS
+    content is held to the same standard as every other source.
+    """
+    return _extract_body_shared(
+        soup,
+        custom_selectors=["#maincontent", "main", ".nhsuk-main-wrapper", "article", "[role='main']"],
+    )
 
 
 def _clean_text(text: str | None) -> str | None:

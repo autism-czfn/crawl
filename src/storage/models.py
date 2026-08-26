@@ -56,6 +56,13 @@ class CrawledItem(Base):
     near_duplicate_of = Column(Text, nullable=True)   # URL of canonical item if near-dup detected
     # P2-3: embedding schema version
     embedding_schema_version = Column(Text, nullable=True)
+    # Sleep/eating/adhd expansion: multi-domain classification. Lists of
+    # strings stored as JSONB (matching content_fingerprint's existing
+    # convention), e.g. domain_tags=["adhd","autism"] for a comorbidity
+    # paper matched by more than one surface — merged, not overwritten, on
+    # upsert (see pipeline.py::_merge_tag_list).
+    domain_tags = Column(JSONB, nullable=True)
+    topic_tags = Column(JSONB, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("url", name="uq_crawled_items_url"),
@@ -90,6 +97,10 @@ class Chunk(Base):
     heading_path = Column(Text, nullable=True)   # e.g. "Symptoms > Sleep Disorders"
     # P2-3: embedding schema version
     embedding_schema_version = Column(Text, nullable=True)
+    # Sleep/eating/adhd expansion: propagated from the parent CrawledItem at
+    # chunk-insert time, same as authority_tier/source_type above.
+    domain_tags = Column(JSONB, nullable=True)
+    topic_tags = Column(JSONB, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("crawled_item_id", "chunk_index", name="uq_chunk_item_index"),
@@ -120,6 +131,11 @@ class Surface(Base):
     last_run_count = Column(Integer, nullable=True)
     consecutive_fails = Column(Integer, nullable=False, default=0)
     overrides_json = Column(JSONB, nullable=True)
+    # Sleep/eating/adhd expansion: static per-surface default, synced from
+    # surfaces.json exactly like authority_tier/source_type/audience_type
+    # above, then propagated to each crawled_item by pipeline.py.
+    domain_tags = Column(JSONB, nullable=True)
+    topic_tags = Column(JSONB, nullable=True)
 
 
 class HttpCache(Base):

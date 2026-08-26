@@ -315,18 +315,26 @@ def _extract_article(
 ) -> CollectedItem | None:
     """Extract article metadata using Strategy C priority order."""
 
+    # Per-site "body" selectors (curated for non-English/JS-light templates
+    # where Trafilatura's generic heuristics tend to miss) are handed to the
+    # shared body extractor as an extra fallback, regardless of which
+    # strategy below ends up supplying the title/description.
+    site_selectors = surface_selectors or _SITE_SELECTORS.get(domain) or {}
+    body_css = site_selectors.get("body", "")
+    custom_body_selectors = [s.strip() for s in body_css.split(",") if s.strip()] or None
+
     # 1. Try JSON-LD
-    item = _from_jsonld(soup, url, domain)
+    item = _from_jsonld(soup, url, domain, custom_body_selectors)
     if item:
         return item
 
     # 2. Try Open Graph
-    item = _from_opengraph(soup, url, domain)
+    item = _from_opengraph(soup, url, domain, custom_body_selectors)
     if item:
         return item
 
     # 3. Try per-site CSS selectors
-    item = _from_css_selectors(soup, url, domain, surface_selectors)
+    item = _from_css_selectors(soup, url, domain, surface_selectors, custom_body_selectors)
     if item:
         return item
 
@@ -334,7 +342,7 @@ def _extract_article(
     return None
 
 
-def _from_jsonld(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem | None:
+def _from_jsonld(soup: BeautifulSoup, url: str, domain: str, custom_body_selectors: list[str] | None = None) -> CollectedItem | None:
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
@@ -363,7 +371,7 @@ def _from_jsonld(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem | 
                 source="html_crawl",
                 external_id=None,
                 description=_clean_text(description),
-                content_body=_extract_body_shared(soup),
+                content_body=_extract_body_shared(soup, custom_selectors=custom_body_selectors),
                 author=author,
                 authors_json=None,
                 published_at=published_at,
@@ -379,7 +387,7 @@ def _from_jsonld(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem | 
     return None
 
 
-def _from_opengraph(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem | None:
+def _from_opengraph(soup: BeautifulSoup, url: str, domain: str, custom_body_selectors: list[str] | None = None) -> CollectedItem | None:
     def og(prop: str) -> str | None:
         tag = soup.find("meta", property=f"og:{prop}")
         return tag["content"].strip() if tag and tag.get("content") else None
@@ -402,7 +410,7 @@ def _from_opengraph(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem
         source="html_crawl",
         external_id=None,
         description=_clean_text(description),
-        content_body=_extract_body_shared(soup),
+        content_body=_extract_body_shared(soup, custom_selectors=custom_body_selectors),
         author=author,
         authors_json=None,
         published_at=published_at,
@@ -415,7 +423,13 @@ def _from_opengraph(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem
     )
 
 
-def _from_css_selectors(soup: BeautifulSoup, url: str, domain: str, surface_selectors: dict | None = None) -> CollectedItem | None:
+def _from_css_selectors(
+    soup: BeautifulSoup,
+    url: str,
+    domain: str,
+    surface_selectors: dict | None = None,
+    custom_body_selectors: list[str] | None = None,
+) -> CollectedItem | None:
     selectors = surface_selectors or _SITE_SELECTORS.get(domain)
     if not selectors:
         return None
@@ -440,7 +454,7 @@ def _from_css_selectors(soup: BeautifulSoup, url: str, domain: str, surface_sele
         source="html_crawl",
         external_id=None,
         description=_clean_text(sel(selectors.get("body", ""))),
-        content_body=_extract_body_shared(soup),
+        content_body=_extract_body_shared(soup, custom_selectors=custom_body_selectors),
         author=sel(selectors.get("author", "")),
         authors_json=None,
         published_at=sel(selectors.get("date", "")),

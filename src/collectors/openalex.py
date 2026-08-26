@@ -1,9 +1,17 @@
-"""OpenAlex REST API collector (no key needed; polite pool via mailto)."""
+"""OpenAlex REST API collector (no key needed; polite pool via mailto).
+
+Full-text strategy:
+  When open_access.oa_url is present, fetch it (HTML via trafilatura, or
+  PDF if the link points at one) and use it as content_body; falls back
+  to the abstract reconstructed from the inverted index.
+"""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from src.collectors.base import CollectedItem, normalize_doi
+from src.collectors.fulltext import fetch_html_and_extract, fetch_pdf_url
 from src.config import settings
 from src.http.client import get_shared_client
 
@@ -37,7 +45,7 @@ async def collect(
         "per-page": min(limit, 200),
         "cursor": oa_cursor,
         "sort": "publication_date:desc",
-        "select": "id,title,doi,publication_date,authorships,primary_location,open_access,abstract_inverted_index,cited_by_count",
+        "select": "id,title,doi,publication_date,authorships,primary_location,open_access,best_oa_location,abstract_inverted_index,cited_by_count",
         "mailto": settings.CRAWLER_EMAIL,
     }
 
@@ -101,6 +109,9 @@ async def collect(
         journal = (r.get("primary_location") or {}).get("source", {}) or {}
         journal_name = journal.get("display_name") if isinstance(journal, dict) else None
 
+        best_oa = r.get("best_oa_location") or {}
+        oa_url = best_oa.get("pdf_url") or best_oa.get("landing_page_url")
+
         items.append(
             CollectedItem(
                 title=title,
@@ -117,8 +128,28 @@ async def collect(
                 journal=journal_name,
                 open_access=is_oa,
                 engagement={"cited_by_count": r.get("cited_by_count", 0)},
-                raw_payload=r,
+                raw_payload={**r, "_oa_url": oa_url},
             )
         )
+
+    # Fetch full text concurrently for articles with a known OA location
+    client = get_shared_client()
+
+    async def _enrich(item: CollectedItem) -> CollectedItem:
+        link = item.get("raw_payload", {}).pop("_oa_url", None)
+        if not link:
+            return item
+        if link.lower().endswith(".pdf"):
+            text = await fetch_pdf_url(client, link)
+        else:
+            text = await fetch_html_and_extract(client, link)
+        if text:
+            item["content_body"] = text
+        return item
+
+    items = list(await asyncio.gather(*[_enrich(item) for item in items]))
+
+    full_count = sum(1 for it in items if it.get("content_body"))
+    logger.info("OpenAlex: %d works, %d with full text", len(items), full_count)
 
     return items, next_cursor

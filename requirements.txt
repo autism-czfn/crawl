@@ -21,3 +21,7 @@ yt-dlp>=2024.1.0
 # Django admin site
 django>=4.2.0
 psycopg2-binary>=2.9.0
+
+# Dev / test
+pytest>=8.0.0
+pytest-asyncio>=0.24.0

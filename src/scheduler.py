@@ -104,6 +104,8 @@ class Scheduler:
                         language=s.get("language", "en"),
                         country=s.get("country"),
                         organization_name=s.get("organization_name"),
+                        domain_tags=s.get("domain_tags"),
+                        topic_tags=s.get("topic_tags"),
                     )
                     session.add(surface)
                     logger.info("Seeded surface: %s", s["key"])
@@ -129,6 +131,8 @@ class Scheduler:
                             language=s.get("language", existing.language),
                             country=s.get("country", existing.country),
                             organization_name=s.get("organization_name", existing.organization_name),
+                            domain_tags=s.get("domain_tags", existing.domain_tags),
+                            topic_tags=s.get("topic_tags", existing.topic_tags),
                         )
                     )
                     logger.debug("Updated surface config: %s", s["key"])

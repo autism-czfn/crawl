@@ -9,7 +9,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urldefrag
 
-from sqlalchemy import select, update, text
+from sqlalchemy import select, update, text, case, desc, cast, String
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -105,11 +105,23 @@ _EVIDENCE_KEYWORDS: dict[str, list[str]] = {
     "guideline": ["clinical guideline", "practice guideline", "dsm-5", "icd-"],
 }
 
+# Platforms whose content type is known from the platform itself, independent
+# of any title/description keyword match — checked after the keyword scan
+# above but before the generic source_type fallback below. Added alongside
+# the sleep/eating/adhd expansion because most government/hospital pages
+# (CDC, NHS, Mayo, ...) never contain phrases like "systematic review" or
+# "RCT", so the keyword-only inference left them with evidence_level=None.
+_PLATFORM_EVIDENCE_LEVEL: dict[str, str] = {
+    "biorxiv": "preprint",           # bioRxiv/medRxiv preprints, by construction
+    "clinicaltrials": "clinical_trial",
+}
+
 
 def _infer_evidence_level(
     title: str,
     description: str | None,
     source_type: str | None,
+    platform: str | None = None,
 ) -> str | None:
     if source_type in ("forum", "reddit", "social"):
         return "anecdotal"
@@ -119,6 +131,19 @@ def _infer_evidence_level(
     for level, keywords in _EVIDENCE_KEYWORDS.items():
         if any(kw in text for kw in keywords):
             return level
+    if platform in _PLATFORM_EVIDENCE_LEVEL:
+        return _PLATFORM_EVIDENCE_LEVEL[platform]
+    if source_type == "official_health" and platform in ("html_crawl", "playwright_crawl", "nhs_api"):
+        return "government_guidance"
+    if source_type == "hospital":
+        return "hospital_education"
+    if source_type == "academic":
+        # Academic-API content (PubMed/EuropePMC/Semantic Scholar/CrossRef/
+        # DOAJ/OpenAlex/CORE) is peer-reviewed journal literature by
+        # definition once preprints and trial registrations are excluded
+        # above. Supersedes the old source_type=="peer_reviewed" branch
+        # below, which nothing in surfaces.json ever actually set.
+        return "peer_reviewed_study"
     if source_type == "peer_reviewed":
         return "peer_reviewed"
     return None
@@ -193,6 +218,43 @@ async def _find_near_duplicate(
 
 
 # ---------------------------------------------------------------------------
+# Multi-domain tag merge (sleep/eating/adhd expansion)
+# ---------------------------------------------------------------------------
+
+async def _merge_tag_list(
+    session: AsyncSession,
+    column: str,
+    url: str,
+    new_tags: list[str] | None,
+) -> list[str]:
+    """Union new_tags with whatever is already stored in `column` for `url`.
+
+    Same content item can legitimately be reached by more than one surface
+    (e.g. an autism+ADHD comorbidity paper matches both pubmed_autism and
+    pubmed_adhd) and should keep every domain it was matched under, not just
+    whichever surface's crawl happened to upsert it first. Done as a Python-side
+    SELECT + set-union — matching this codebase's existing style in
+    _find_near_duplicate() above, whose own comments note that JSONB ?| / ?&
+    operators are incompatible with asyncpg's parameter binding — rather than
+    a SQL-side JSONB expression in the ON CONFLICT clause.
+    """
+    new_set = set(new_tags or [])
+    if not url:
+        return sorted(new_set)
+    try:
+        result = await session.execute(
+            text(f"SELECT {column} FROM crawled_items WHERE url = :url"),
+            {"url": url},
+        )
+        row = result.first()
+    except Exception as exc:
+        logger.debug("_merge_tag_list(%s) lookup failed (non-critical): %s", column, exc)
+        return sorted(new_set)
+    existing = set(row[0]) if row and row[0] else set()
+    return sorted(existing | new_set)
+
+
+# ---------------------------------------------------------------------------
 # Main ingest function
 # ---------------------------------------------------------------------------
 
@@ -214,6 +276,9 @@ async def save_items(
     _source_type: str | None = surface.source_type if surface else None
     _authority_tier: int | None = surface.authority_tier if surface else None
     _audience_type: str | None = surface.audience_type if surface else None
+    _platform: str | None = surface.platform if surface else None
+    _domain_tags: list[str] | None = surface.domain_tags if surface else None
+    _topic_tags: list[str] | None = surface.topic_tags if surface else None
 
     inserted = 0
     for item in items:
@@ -255,6 +320,7 @@ async def save_items(
             title,
             item.get("description"),
             source_type,
+            _platform,
         )
 
         # P3-B: content fingerprint
@@ -267,6 +333,13 @@ async def save_items(
                 "Near-duplicate detected: url=%s is dup of %s (Jaccard > 0.70)",
                 url, near_duplicate_of,
             )
+
+        # Sleep/eating/adhd expansion: union this surface's domain_tags/
+        # topic_tags with whatever is already stored for this URL, so an
+        # item matched by more than one surface (e.g. autism+ADHD comorbidity
+        # research) keeps every domain it belongs to.
+        domain_tags = await _merge_tag_list(session, "domain_tags", url, _domain_tags)
+        topic_tags = await _merge_tag_list(session, "topic_tags", url, _topic_tags)
 
         row = {
             "external_id": item.get("external_id"),
@@ -296,6 +369,8 @@ async def save_items(
             "evidence_level": evidence_level,
             "content_fingerprint": content_fingerprint,
             "near_duplicate_of": near_duplicate_of,
+            "domain_tags": domain_tags,
+            "topic_tags": topic_tags,
         }
 
         stmt = insert(CrawledItem).values(**row)
@@ -317,6 +392,11 @@ async def save_items(
                 "evidence_level": stmt.excluded.evidence_level,
                 "content_fingerprint": stmt.excluded.content_fingerprint,
                 "near_duplicate_of": stmt.excluded.near_duplicate_of,
+                # Already the union of the existing row + this surface's tags
+                # (computed pre-upsert by _merge_tag_list) — not a plain
+                # overwrite. See _merge_tag_list's docstring.
+                "domain_tags": stmt.excluded.domain_tags,
+                "topic_tags": stmt.excluded.topic_tags,
                 # P1-C: set needs_rechunk=True when content changes (handled below via SQL)
             },
         )
@@ -394,7 +474,7 @@ def _hash_content(content: str | None) -> str | None:
 # Unpaywall enrichment
 # ---------------------------------------------------------------------------
 
-async def enrich_unpaywall(session: AsyncSession, batch_size: int = 50) -> int:
+async def enrich_unpaywall(session: AsyncSession, batch_size: int = 300) -> int:
     """Fetch open-access URLs from Unpaywall for records with DOI.
 
     Also backfills oa_url for existing open_access=True records that
@@ -409,6 +489,14 @@ async def enrich_unpaywall(session: AsyncSession, batch_size: int = 50) -> int:
     # Find records with DOI that need Unpaywall enrichment:
     # - records not yet checked (open_access IS NULL), OR
     # - records already marked OA but missing oa_url (pre-migration backfill)
+    # Priority: sleep/eating records go first (product priority), then newest first —
+    # otherwise this FIFOs through the oldest backlog from other domains and never
+    # catches up to recently-collected sleep/eating items.
+    _priority = case(
+        (cast(CrawledItem.domain_tags, String).ilike("%sleep%"), 0),
+        (cast(CrawledItem.domain_tags, String).ilike("%eating%"), 0),
+        else_=1,
+    )
     result = await session.execute(
         select(CrawledItem.id, CrawledItem.doi)
         .where(CrawledItem.doi.isnot(None))
@@ -416,6 +504,7 @@ async def enrich_unpaywall(session: AsyncSession, batch_size: int = 50) -> int:
             (CrawledItem.open_access.is_(None)) |
             (CrawledItem.open_access.is_(True) & CrawledItem.oa_url.is_(None))
         )
+        .order_by(_priority, desc(CrawledItem.collected_at))
         .limit(batch_size)
     )
     rows = result.fetchall()
@@ -433,19 +522,25 @@ async def enrich_unpaywall(session: AsyncSession, batch_size: int = 50) -> int:
         best_oa = data.get("best_oa_location") or {}
         oa_url = best_oa.get("url_for_pdf") or best_oa.get("url")
 
+        # Always persist the answer, even a negative one (is_oa=False, no oa_url).
+        # Previously this only wrote on a positive result, so every non-OA DOI
+        # (the majority of academic papers) stayed open_access=NULL forever and
+        # kept matching this query's WHERE clause — re-checked every single cycle,
+        # starving new records out of the batch. That was the main reason the
+        # backlog never shrank despite running every 6 hours.
+        await session.execute(
+            update(CrawledItem)
+            .where(CrawledItem.id == row_id)
+            .values(open_access=is_oa, oa_url=oa_url)
+        )
         if is_oa or oa_url:
-            await session.execute(
-                update(CrawledItem)
-                .where(CrawledItem.id == row_id)
-                .values(open_access=is_oa, oa_url=oa_url)  # persist oa_url
-            )
             updated += 1
 
     await session.commit()
     return updated
 
 
-async def enrich_fulltext(session: AsyncSession, batch_size: int = 20) -> int:
+async def enrich_fulltext(session: AsyncSession, batch_size: int = 100) -> int:
     """Fetch full text for open-access records that have an oa_url.
 
     Phase 1: HTML URLs only. PDF URLs are deferred (logged + skipped) until
@@ -458,12 +553,18 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 20) -> int:
     client = get_shared_client()
     enriched = 0
 
+    _priority = case(
+        (cast(CrawledItem.domain_tags, String).ilike("%sleep%"), 0),
+        (cast(CrawledItem.domain_tags, String).ilike("%eating%"), 0),
+        else_=1,
+    )
     result = await session.execute(
         select(CrawledItem.id, CrawledItem.oa_url)
         .where(CrawledItem.open_access.is_(True))
         .where(CrawledItem.content_body.is_(None))
         .where(CrawledItem.doi.isnot(None))
         .where(CrawledItem.oa_url.isnot(None))
+        .order_by(_priority, desc(CrawledItem.collected_at))
         .limit(batch_size)
     )
     rows = result.fetchall()
@@ -480,12 +581,17 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 20) -> int:
                 resp = await client.get(oa_url)
                 if "application/pdf" in resp.headers.get("content-type", ""):
                     extracted = extract_text_from_pdf(resp.content)
-                    if extracted is not None:  # '' = permanent failure sentinel, also stored
-                        await session.execute(
-                            update(CrawledItem)
-                            .where(CrawledItem.id == row_id)
-                            .values(content_body=extracted)  # store '' to mark permanent failure
-                        )
+                    # extracted is None only when pdfplumber raised while parsing
+                    # this exact PDF (locked/corrupt) — the same bytes will fail
+                    # the same way every time, so treat it as permanent too and
+                    # store '' instead of leaving NULL (which re-downloads and
+                    # re-parses this same doomed PDF every 6h cycle forever).
+                    await session.execute(
+                        update(CrawledItem)
+                        .where(CrawledItem.id == row_id)
+                        .values(content_body=extracted or "")
+                    )
+                    if extracted:
                         enriched += 1
                     continue
                 # Fall through to HTML extraction if content-type not PDF
@@ -502,9 +608,17 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 20) -> int:
             soup = BeautifulSoup(resp.text, "html.parser")
             body = extract_body(soup)
 
-            # Quality gate for paywall masquerading as OA
+            # Quality gate for paywall masquerading as OA. These are definitive,
+            # page-structure-level verdicts (not a transient network hiccup), so
+            # persist '' as a permanent-failure sentinel — same convention as the
+            # PDF branch above. Without this, a page that will never pass the
+            # gate gets re-fetched and re-rejected every single 6h cycle forever,
+            # burning batch slots that should go to unfetched records.
             if body is None:
                 logger.debug("enrich_fulltext: empty/low-quality body at %s", oa_url)
+                await session.execute(
+                    update(CrawledItem).where(CrawledItem.id == row_id).values(content_body="")
+                )
                 continue
 
             paywall_signals = [
@@ -513,6 +627,9 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 20) -> int:
             body_lower = body.lower()
             if len(body) < 300 or any(s in body_lower for s in paywall_signals):
                 logger.debug("enrich_fulltext: paywall detected at %s — discarding", oa_url)
+                await session.execute(
+                    update(CrawledItem).where(CrawledItem.id == row_id).values(content_body="")
+                )
                 continue
 
             await session.execute(
@@ -542,7 +659,10 @@ async def enrich_fulltext_loop() -> None:
     Unpaywall has populated oa_url.
     """
     import asyncio as _asyncio
-    _interval = 6 * 3600
+    _interval = 30 * 60  # was 6h — Unpaywall/fetch throughput is bounded by the
+    # per-domain semaphore (=3) in src/http/client.py, not by this loop's own
+    # pacing, and downstream (chunking/embedding) has ample headroom — so cycle
+    # much more often to burn down the backlog faster.
     logger.info("enrich_fulltext loop started (interval=%ds)", _interval)
     while True:
         try:

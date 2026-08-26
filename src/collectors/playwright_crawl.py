@@ -41,6 +41,29 @@ logger = logging.getLogger(__name__)
 # Maximum pages to visit per run (safety cap)
 _MAX_PAGES = 50
 
+# Page-title substrings indicating we did not get real content — either a
+# bot-protection challenge/block page, or a bare HTTP-error page rendered as
+# HTML. Found live while validating hopkinsmedicine.org: its Cloudflare
+# variant titles the block page "Attention Required! | Cloudflare", not
+# "Just a Moment..." (the only pattern this used to check for) — both must
+# be treated the same way: don't wait-and-retry past a straight block/error,
+# and don't fall through to storing the block page itself as a "real" item
+# via the last-resort <title> tag path.
+_NON_CONTENT_TITLE_MARKERS = (
+    "just a moment",
+    "attention required",
+    "403 forbidden",
+    "404 not found",
+    "access denied",
+)
+
+
+def _looks_like_non_content_title(title: str | None) -> bool:
+    if not title:
+        return False
+    lowered = title.lower()
+    return any(marker in lowered for marker in _NON_CONTENT_TITLE_MARKERS)
+
 # Per-site CSS selectors — same idea as html_crawl but for JS-rendered pages
 _SITE_SELECTORS: dict[str, dict[str, str]] = {
     "autism-insar.org": {
@@ -173,7 +196,11 @@ async def _fetch_page(
         # Extra wait for JS-rendered content / Cloudflare interstitial
         await page.wait_for_timeout(wait_ms)
 
-        # Check if we're still on a Cloudflare challenge page
+        # Check if we're on a challenge/block/error page rather than real
+        # content. Only "just a moment" is worth an extra wait (it's a JS
+        # challenge that can resolve); the others (a Cloudflare block screen,
+        # a bare 403/404) won't change no matter how long we wait, so give
+        # up immediately rather than burning 10s for nothing.
         title = await page.title()
         if "just a moment" in title.lower():
             logger.warning(
@@ -182,9 +209,12 @@ async def _fetch_page(
             )
             await page.wait_for_timeout(10_000)
             title = await page.title()
-            if "just a moment" in title.lower():
-                logger.error("playwright_crawl: could not pass Cloudflare challenge for %s", url)
-                return None
+
+        if _looks_like_non_content_title(title):
+            logger.error(
+                "playwright_crawl: got a block/error page (title=%r) for %s", title, url,
+            )
+            return None
 
         return await page.content()
 

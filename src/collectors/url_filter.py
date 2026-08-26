@@ -19,6 +19,7 @@ Rules (applied in order):
 
 from __future__ import annotations
 
+import re
 from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
@@ -95,8 +96,63 @@ _BLOCKED_SEGMENTS: frozenset[str] = frozenset(
         "legal",
         "cookies",
         "cookie-policy",
+        # ---- Hospital/clinic site navigation (found while adding sleep/
+        # eating/ADHD hospital sources — childrenshospital.org, chop.edu,
+        # healthychildren.org all surface these as top nav on every page) ----
+        "find-a-doctor",
+        "find-a-provider",
+        "request-appointment",
+        "make-an-appointment",
+        "schedule-appointment",
+        "pay-your-bill-online",
+        "pay-bill",
+        "billing-insurance",
+        "doctors-departments",
+        "sponsors",
+        "events",
+        "mychart",  # patient-portal login, found on hopkinsmedicine.org
     }
 )
+
+# Multi-word blocked segments get matched as a contiguous run of hyphen-
+# tokens within a longer compound segment, not just as a whole-segment exact
+# match (see _segment_is_blocked below) — e.g. Hopkins links to
+# "johns-hopkins-medicine-request-appointment", a single path segment that
+# contains but does not equal "request-appointment". Split out from
+# _BLOCKED_SEGMENTS (rather than doing this for every entry) because it's
+# only safe for genuinely multi-word phrases: a single blocked word like
+# "login" or "donate" deliberately stays a whole-segment match, so a slug
+# like "the-login-page-redesign" is NOT blocked just because "login" is one
+# of its words — that was the original design's own stated rationale.
+_MULTI_WORD_BLOCKED_TOKENS: tuple[tuple[str, ...], ...] = tuple(
+    tuple(seg.split("-")) for seg in _BLOCKED_SEGMENTS if "-" in seg
+)
+
+# Page-file extensions to strip before matching a segment against
+# _BLOCKED_SEGMENTS. Without this, ASP.NET-style sites (e.g. healthychildren.org)
+# produce segments like "login.aspx" or "default.aspx" that pass the blocklist
+# check by exact-string mismatch even though "login"/"account" alone would be
+# blocked.
+_SEGMENT_EXTENSION_RE = re.compile(r"\.(aspx|html?|php|jsp|cfm)$", re.IGNORECASE)
+
+
+def _contains_subsequence(tokens: list[str], sub: tuple[str, ...]) -> bool:
+    """True if `sub` appears as a contiguous run within `tokens`."""
+    n = len(sub)
+    return any(tokens[i:i + n] == list(sub) for i in range(len(tokens) - n + 1))
+
+
+def _segment_is_blocked(seg: str) -> bool:
+    """Whole-segment match against _BLOCKED_SEGMENTS (extension-stripped),
+    plus a contiguous-subsequence match for multi-word blocked phrases
+    against the segment's own hyphen-split tokens."""
+    if seg in _BLOCKED_SEGMENTS:
+        return True
+    stripped = _SEGMENT_EXTENSION_RE.sub("", seg)
+    if stripped != seg and stripped in _BLOCKED_SEGMENTS:
+        return True
+    tokens = stripped.split("-")
+    return any(_contains_subsequence(tokens, sub) for sub in _MULTI_WORD_BLOCKED_TOKENS)
 
 
 def is_content_url(
@@ -151,8 +207,10 @@ def is_content_url(
     # Split path into non-empty lower-cased segments
     segments = [s.lower() for s in parsed.path.split("/") if s]
 
-    # Rule 2 — no blocked segment
-    if any(seg in _BLOCKED_SEGMENTS for seg in segments):
+    # Rule 2 — no blocked segment (see _segment_is_blocked for the exact
+    # matching rules: whole-segment, extension-stripped, and multi-word
+    # subsequence-within-a-compound-segment).
+    if any(_segment_is_blocked(seg) for seg in segments):
         return False
 
     # Rule 3 — minimum path segments (default 2, configurable per surface)

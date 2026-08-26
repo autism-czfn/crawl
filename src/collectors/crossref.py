@@ -1,9 +1,21 @@
-"""CrossRef API collector (polite pool via mailto)."""
+"""CrossRef API collector (polite pool via mailto).
+
+Full-text strategy:
+  CrossRef indexes citation metadata for essentially all scholarly
+  literature, most of which sits behind a publisher paywall — so full
+  text is only attempted when the work itself signals it's open access
+  (a Creative Commons license entry in the response).  Prefers a direct
+  PDF link when CrossRef supplies one, otherwise fetches the work's own
+  URL.  Falls back to the abstract when no CC signal is present or the
+  fetch fails.
+"""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from src.collectors.base import CollectedItem, normalize_doi
+from src.collectors.fulltext import fetch_html_and_extract, fetch_pdf_url
 from src.config import settings
 from src.http.client import get_shared_client
 
@@ -86,6 +98,16 @@ async def collect(
 
         abstract = w.get("abstract", "").strip() or None
 
+        # OA signal: a Creative Commons license entry means the work is
+        # very likely free to fetch, unlike most CrossRef-indexed papers.
+        license_list = w.get("license", []) or []
+        is_cc = any("creativecommons.org" in (lic.get("URL") or "") for lic in license_list)
+        pdf_link = next(
+            (l.get("URL") for l in (w.get("link", []) or []) if l.get("content-type") == "application/pdf"),
+            None,
+        )
+        fetch_url = (pdf_link or url) if is_cc else None
+
         items.append(
             CollectedItem(
                 title=title,
@@ -100,11 +122,31 @@ async def collect(
                 rank_position=None,
                 doi=doi,
                 journal=journal,
-                open_access=None,
+                open_access=is_cc or None,
                 engagement={},
-                raw_payload=w,
+                raw_payload={**w, "_fetch_url": fetch_url},
             )
         )
+
+    # Fetch full text concurrently for works that signal open access
+    client = get_shared_client()
+
+    async def _enrich(item: CollectedItem) -> CollectedItem:
+        link = item.get("raw_payload", {}).pop("_fetch_url", None)
+        if not link:
+            return item
+        if link.lower().endswith(".pdf"):
+            text = await fetch_pdf_url(client, link)
+        else:
+            text = await fetch_html_and_extract(client, link)
+        if text:
+            item["content_body"] = text
+        return item
+
+    items = list(await asyncio.gather(*[_enrich(item) for item in items]))
+
+    full_count = sum(1 for it in items if it.get("content_body"))
+    logger.info("CrossRef: %d works, %d with full text", len(items), full_count)
 
     next_cursor = str(new_offset) if new_offset < total else None
     return items, next_cursor

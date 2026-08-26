@@ -1,4 +1,11 @@
-"""ClinicalTrials.gov API v2 collector."""
+"""ClinicalTrials.gov API v2 collector.
+
+Full-text strategy:
+  The registry API itself exposes a DetailedDescription field (the full
+  study protocol description), so no external fetch is needed — just
+  request the field and store it as content_body alongside the
+  BriefSummary abstract.
+"""
 from __future__ import annotations
 
 import logging
@@ -31,7 +38,7 @@ async def collect(
         "filter.overallStatus": status,
         "pageSize": min(limit, 100),
         "format": "json",
-        "fields": "NCTId,BriefTitle,OfficialTitle,BriefSummary,OverallStatus,StartDate,CompletionDate,Condition,StudyType,Phase,EnrollmentCount,LeadSponsorName",
+        "fields": "NCTId,BriefTitle,OfficialTitle,BriefSummary,DetailedDescription,OverallStatus,StartDate,CompletionDate,Condition,StudyType,Phase,EnrollmentCount,LeadSponsorName",
     }
     if cursor:
         params["pageToken"] = cursor
@@ -65,6 +72,7 @@ async def collect(
             continue
 
         summary = desc_mod.get("briefSummary", "").strip() or None
+        detailed = desc_mod.get("detailedDescription", "").strip() or None
         start_date = status_mod.get("startDateStruct", {}).get("date")
         published_at = f"{start_date}T00:00:00+00:00" if start_date else None
 
@@ -77,7 +85,7 @@ async def collect(
                 source="clinicaltrials",
                 external_id=nct_id,
                 description=summary,
-                content_body=None,
+                content_body=detailed,
                 author=sponsor,
                 authors_json=None,
                 published_at=published_at,

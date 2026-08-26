@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 _BASE = "https://api.semanticscholar.org/graph/v1/paper/search"
 _FIELDS = "title,url,abstract,authors,year,externalIds,publicationDate,venue,isOpenAccess,openAccessPdf,citationCount"
 
+# S2 returns this literal sentinel in the `abstract` field (instead of null)
+# when the publisher hasn't licensed the abstract for the public API tier.
+_ABSTRACT_UNAVAILABLE = "Not available for public API users."
+
 
 async def collect(
     config: dict,
@@ -89,13 +93,16 @@ async def collect(
 
         pdf_url = (p.get("openAccessPdf") or {}).get("url")
 
+        abstract = (p.get("abstract") or "").strip()
+        description = None if abstract == _ABSTRACT_UNAVAILABLE else (abstract or None)
+
         items.append(
             CollectedItem(
                 title=title,
                 url=paper_url,
                 source="semanticscholar",
                 external_id=p.get("paperId"),
-                description=p.get("abstract") or None,
+                description=description,
                 content_body=None,  # enriched below
                 author=authors_json[0]["family"] if authors_json else None,
                 authors_json=authors_json or None,

@@ -56,6 +56,8 @@ async def run_once(max_items: int = _BATCH_SIZE) -> int:
                 CrawledItem.authority_tier,
                 CrawledItem.published_at,
                 CrawledItem.lang,
+                CrawledItem.domain_tags,
+                CrawledItem.topic_tags,
             )
             .where(CrawledItem.needs_rechunk == True)  # noqa: E712
             .where(CrawledItem.content_body.isnot(None))
@@ -82,6 +84,8 @@ async def run_once(max_items: int = _BATCH_SIZE) -> int:
                 CrawledItem.authority_tier,
                 CrawledItem.published_at,
                 CrawledItem.lang,
+                CrawledItem.domain_tags,
+                CrawledItem.topic_tags,
             )
             .where(CrawledItem.content_body.isnot(None))
             .where(CrawledItem.content_body != "")
@@ -114,6 +118,8 @@ async def run_once(max_items: int = _BATCH_SIZE) -> int:
             published_at = row.published_at
             lang = row.lang
             domain = _extract_domain(url)
+            domain_tags = row.domain_tags
+            topic_tags = row.topic_tags
 
             # Delete stale chunks if this is a re-chunk pass
             if row in rechunk_rows:
@@ -147,6 +153,8 @@ async def run_once(max_items: int = _BATCH_SIZE) -> int:
                     authority_tier=authority_tier,
                     published_at=published_at,
                     lang=lang,
+                    domain_tags=domain_tags,
+                    topic_tags=topic_tags,
                     is_summary=False,
                     section_heading=None,
                     heading_path=None,
@@ -169,6 +177,8 @@ async def run_once(max_items: int = _BATCH_SIZE) -> int:
                     authority_tier=authority_tier,
                     published_at=published_at,
                     lang=lang,
+                    domain_tags=domain_tags,
+                    topic_tags=topic_tags,
                     is_summary=True,
                     section_heading=None,
                     heading_path=None,

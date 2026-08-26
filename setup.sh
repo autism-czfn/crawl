@@ -247,6 +247,30 @@ only_migrate() {
     echo
 }
 
+# ── Option 9 — Run test suite ──────────────────────────────────────────────────
+run_tests() {
+    echo
+    if ! "$PYTHON" -m pytest --version &>/dev/null; then
+        warn "pytest not found — installing test dependencies ..."
+        pip install --quiet pytest pytest-asyncio
+    fi
+
+    info "Running test suite (tests/) ..."
+    echo
+    # Not `check_env`-gated and no `run_migrations` — the suite is pure unit
+    # tests (no live DB/network calls), so it works even before first setup.
+    # Guarded with if/then, not bare `set -e`, so a failing test reports a
+    # clear summary instead of silently killing the whole menu loop.
+    if "$PYTHON" -m pytest tests/ -v; then
+        echo
+        success "All tests passed."
+    else
+        echo
+        error "Some tests failed — see output above."
+    fi
+    echo
+}
+
 # ── Django admin PID helpers ───────────────────────────────────────────────────
 is_admin_running() {
     # 1. PID file exists — validate it's alive AND is actually the Django admin.
@@ -1142,9 +1166,10 @@ print_menu() {
     echo -e "  ${RED}6)${RESET} Stop all services     (crawler + Django admin)"
     echo -e "  ${CYAN}7)${RESET} Show DB stats         (size / crawled items / sources)"
     echo -e "  ${GREEN}8)${RESET} Install & initialize PostgreSQL"
+    echo -e "  ${CYAN}9)${RESET} Run test suite         (pytest tests/)"
     echo -e "  ${RED}0)${RESET} Exit"
     echo
-    echo -n "  Select an option [0-8]: "
+    echo -n "  Select an option [0-9]: "
 }
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -1163,6 +1188,7 @@ while true; do
         6) stop_all          ;;
         7) show_db_stats     ;;
         8) install_postgres  ;;
+        9) run_tests         ;;
         0)
             echo
             info "Goodbye."
@@ -1170,7 +1196,7 @@ while true; do
             exit 0
             ;;
         *)
-            error "Invalid option '${choice}'. Please enter 0–8."
+            error "Invalid option '${choice}'. Please enter 0–9."
             ;;
     esac
 done
