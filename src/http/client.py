@@ -83,7 +83,11 @@ class CircuitBreaker:
 
 DOMAIN_RATE_LIMITS: dict[str, float] = {
     "reddit.com": 60,
-    "pubmed.ncbi.nlm.nih.gov": 10,
+    "pubmed.ncbi.nlm.nih.gov": 10,  # human-readable article pages (enrich_fulltext)
+    "eutils.ncbi.nlm.nih.gov": 10,  # the ACTUAL PubMed API domain — was missing
+    # (pubmed.py calls eutils.ncbi.nlm.nih.gov, not pubmed.ncbi.nlm.nih.gov;
+    # without this entry every real esearch/efetch call silently fell back
+    # to DEFAULT_RATE_LIMIT instead of the intended 10 rpm)
     "ebi.ac.uk": 10,
     "api.semanticscholar.org": 20,
     "api.crossref.org": 50,
@@ -98,6 +102,34 @@ DOMAIN_RATE_LIMITS: dict[str, float] = {
     "wrongplanet.net": 6,
 }
 DEFAULT_RATE_LIMIT = 20  # rpm
+
+
+# ---------------------------------------------------------------------------
+# Per-domain concurrency (Action item A1 — 2026-08-26)
+# ---------------------------------------------------------------------------
+# Every domain used to share ONE concurrency value (3) regardless of type.
+# Academic APIs are built for automated/parallel access and document their
+# own rate limits above (which still cap total throughput via the token
+# bucket) — there's no reason to also cap them at the same concurrency as a
+# human-facing HTML site sitting behind CDN/anti-bot protection. Playwright
+# stays separately capped even lower at the scheduler level (see
+# src/scheduler.py _PLAYWRIGHT_CONCURRENCY). doi.org is deliberately NOT
+# listed here despite being hit by every academic collector — it's a shared
+# redirect front-door for every publisher's DOIs, and empirically 429s us
+# aggressively on its own; raising its concurrency would make that worse,
+# not better.
+DOMAIN_CONCURRENCY: dict[str, int] = {
+    "eutils.ncbi.nlm.nih.gov": 8,
+    "api.crossref.org": 8,
+    "api.openalex.org": 8,
+    "ebi.ac.uk": 8,
+    "api.semanticscholar.org": 6,
+    "api.core.ac.uk": 6,
+    "api.biorxiv.org": 6,
+    "clinicaltrials.gov": 6,
+    "doaj.org": 3,  # explicitly rate-limited to 2 rpm above — concurrency wouldn't help
+}
+DEFAULT_CONCURRENCY = 3  # unchanged default for HTML/Playwright/everything else
 
 
 def _domain(url: str) -> str:
@@ -161,7 +193,8 @@ class RateLimitedClient:
 
     def _semaphore(self, domain: str) -> asyncio.Semaphore:
         if domain not in self._semaphores:
-            self._semaphores[domain] = asyncio.Semaphore(3)
+            limit = DOMAIN_CONCURRENCY.get(domain, DEFAULT_CONCURRENCY)
+            self._semaphores[domain] = asyncio.Semaphore(limit)
         return self._semaphores[domain]
 
     def _breaker(self, domain: str) -> CircuitBreaker:
@@ -201,19 +234,34 @@ class RateLimitedClient:
                 try:
                     resp = await self._client.get(url, headers=base_headers, params=params)
 
+                    # Attribute the OUTCOME (breaker success/failure) to the
+                    # FINAL domain after any redirects, not the one we
+                    # originally requested — e.g. doi.org routinely redirects
+                    # to the real publisher, and it's whoever we actually
+                    # landed on that succeeded or blocked us, not doi.org
+                    # itself. The pre-request checks above (allow_request,
+                    # rate bucket, concurrency semaphore) unavoidably still
+                    # key on the requested domain — we don't know the
+                    # destination until after the request completes — but
+                    # that's fine: those are about not hammering the front
+                    # door itself, which is a legitimate concern regardless
+                    # of where it redirects.
+                    final_domain = _domain(str(resp.url))
+                    outcome_breaker = self._breaker(final_domain) if final_domain != domain else breaker
+
                     if resp.status_code in range(200, 300) or resp.status_code == 304:
-                        breaker.record_success()
+                        outcome_breaker.record_success()
                         return resp
 
                     if resp.status_code == 429:
                         retry_after = float(resp.headers.get("Retry-After", exponential_backoff(attempt)))
-                        logger.warning("429 on %s — waiting %.1fs", domain, retry_after)
+                        logger.warning("429 on %s — waiting %.1fs", final_domain, retry_after)
                         await asyncio.sleep(retry_after)
                         continue
 
                     if resp.status_code == 403:
-                        breaker.record_failure()
-                        logger.error("403 BLOCKED on %s", domain)
+                        outcome_breaker.record_failure()
+                        logger.error("403 BLOCKED on %s", final_domain)
                         # resp.url is the FINAL URL after any redirects (e.g.
                         # doi.org -> the actual publisher) — attach it so
                         # callers that attribute blame per-domain (see
@@ -229,7 +277,7 @@ class RateLimitedClient:
 
                     if resp.status_code >= 500:
                         wait = exponential_backoff(attempt)
-                        logger.warning("%d on %s — retrying in %.1fs", resp.status_code, domain, wait)
+                        logger.warning("%d on %s — retrying in %.1fs", resp.status_code, final_domain, wait)
                         await asyncio.sleep(wait)
                         continue
 

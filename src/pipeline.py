@@ -458,6 +458,17 @@ async def save_items(
             )
             await session.commit()
         except Exception as exc:
+            # This IS genuinely non-critical (content just won't be flagged
+            # for re-embedding this round) — BUT without the rollback, a
+            # failed statement here leaves the session's transaction in an
+            # ABORTED state, and since save_items() returns normally after
+            # this (no re-raise), that poisoned session gets handed straight
+            # back to the caller. The next unrelated statement on it then
+            # fails too with "current transaction is aborted" — which is
+            # exactly the clinicaltrials_* failure signature this was traced
+            # from (scheduler.py's own surfaces-table UPDATE failing right
+            # after save_items() returns, with no error of its own).
+            await session.rollback()
             logger.debug("Re-embedding/rechunk trigger failed (non-critical): %s", exc)
 
     return inserted
@@ -562,8 +573,28 @@ def _get_pdf_pool():
     global _pdf_pool
     if _pdf_pool is None:
         from concurrent.futures import ProcessPoolExecutor
+        logger.info("Spawning PDF-parsing process pool (4 workers)")
         _pdf_pool = ProcessPoolExecutor(max_workers=4)
     return _pdf_pool
+
+
+def shutdown_pdf_pool() -> None:
+    """Cleanly terminate the PDF-parsing worker processes on exit.
+
+    Without calling this, killing the crawler's main process does NOT kill
+    its ProcessPoolExecutor children — they get re-parented to PID 1 and
+    keep running indefinitely, each holding real memory. This bit the
+    machine directly on 2026-08-26: 3 stop/restart cycles during
+    development left 15 orphaned worker processes running (from 02:04,
+    02:35, 02:50), consuming most of the machine's free RAM. src/main.py
+    calls this on SIGTERM/SIGINT so a normal restart cleans up after itself
+    (a bare `kill -9` still bypasses it — there's no way to intercept that).
+    """
+    global _pdf_pool
+    if _pdf_pool is not None:
+        logger.info("Shutting down PDF-parsing process pool")
+        _pdf_pool.shutdown(wait=False, cancel_futures=True)
+        _pdf_pool = None
 
 
 def _parse_html_body(html_text: str) -> str | None:
