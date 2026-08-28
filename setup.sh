@@ -556,6 +556,7 @@ PYEOF
 show_track_stats() {
     echo
     info "=== Crawled Full Articles by Track (Tier 1 & Tier 2) ==="
+    info "Report generated at (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
     echo
 
     if [[ ! -f .env ]]; then
@@ -736,6 +737,50 @@ except Exception as e:
     import traceback
     print(f"  {WARN}[WARN]{RESET}  DB query failed: {e}")
     traceback.print_exc()
+
+# ── Last enrichment cycle (from crawler.log, not the DB) ──────────────────
+# enrich_fulltext_loop runs every 30 min and logs its own result EVERY time
+# now (including 0 — see src/pipeline.py), so the last matching line is
+# always the true most-recent cycle, never a stale nonzero one from
+# several cycles back.
+import re as _re
+try:
+    log_path = pathlib.Path("crawler.log")
+    with open(log_path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - 800_000))  # scheduler/collector logging in between
+        # the two enrichment lines can be verbose enough to push them apart by
+        # 300KB+ within a single ~30-min cycle — 800KB gives real headroom
+        tail = f.read().decode("utf-8", errors="replace")
+
+    oa_matches = _re.findall(
+        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) INFO:src\.pipeline:enrich_unpaywall: resolved (\d+) OA URLs",
+        tail, _re.MULTILINE,
+    )
+    ft_matches = _re.findall(
+        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) INFO:src\.pipeline:enrich_fulltext: enriched (\d+) records with full text",
+        tail, _re.MULTILINE,
+    )
+
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    print(f"  {BOLD}{CYAN}Last enrichment cycle (from crawler.log){RESET}")
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    if ft_matches:
+        ts, n = ft_matches[-1]
+        print(f"  Full articles downloaded (last ~30-min cycle): {GREEN}{int(n)}{RESET}  "
+              f"{DIM}(logged at {ts}, server-local time — not UTC){RESET}")
+    else:
+        print(f"  {WARN}No enrich_fulltext cycle found in the last ~300KB of crawler.log.{RESET}")
+    if oa_matches:
+        ts, n = oa_matches[-1]
+        print(f"  OA-status checks resolved (same cycle):        {int(n)}  "
+              f"{DIM}(logged at {ts}, server-local time — not UTC){RESET}")
+    print()
+except FileNotFoundError:
+    print(f"  {WARN}crawler.log not found — can't report the last enrichment cycle.{RESET}")
+except Exception as e:
+    print(f"  {WARN}[WARN]{RESET}  Reading crawler.log failed: {e}")
 PYEOF
 }
 

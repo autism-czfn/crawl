@@ -55,15 +55,28 @@ async def collect(
         logger.error("sitemap fetch failed for %s: %s", sitemap_url, exc)
         return [], cursor
 
-    urls = _parse_sitemap(resp.text, filter_path)
+    urls, is_index = _parse_sitemap(resp.text, filter_path)
 
-    # If result is sub-sitemap URLs (sitemap index), fetch each and collect page URLs
-    if urls and urls[0].endswith(".xml"):
+    # If result is sub-sitemap URLs (sitemap index), fetch each and collect page URLs.
+    # NOTE: is_index is determined by the actual XML structure (presence of
+    # <sitemap> elements), NOT by guessing from the URL string — some sites
+    # (NHLBI, FDA) paginate sub-sitemaps as '?page=N' instead of a '.xml'
+    # suffix, which a URL-suffix heuristic would miss entirely.
+    if is_index:
         page_urls: list[str] = []
         for sub_url in urls:
             try:
                 sub_resp = await client.get(sub_url, use_browser_ua=True)
-                page_urls.extend(_parse_sitemap(sub_resp.text, filter_path))
+                sub_urls, sub_is_index = _parse_sitemap(sub_resp.text, filter_path)
+                if sub_is_index:
+                    # Index-of-indexes (two levels deep) — not handled,
+                    # same MVP scope as before. Log so it's visible rather
+                    # than silently dropped.
+                    logger.warning(
+                        "sitemap: nested sitemap index not supported, skipping %s", sub_url
+                    )
+                    continue
+                page_urls.extend(sub_urls)
             except Exception as exc:
                 logger.warning("sitemap: sub-sitemap fetch failed %s: %s", sub_url, exc)
             await asyncio.sleep(0.5)
@@ -102,38 +115,35 @@ async def collect(
     return items, new_cursor
 
 
-def _parse_sitemap(xml_text: str, filter_path: str) -> list[str]:
-    """Parse sitemap XML and return filtered URLs.
+def _parse_sitemap(xml_text: str, filter_path: str) -> tuple[list[str], bool]:
+    """Parse sitemap XML. Returns (urls, is_index).
 
-    Handles both sitemap index files (containing <sitemap> entries)
-    and regular sitemaps (containing <url> entries).
-    For sitemap indexes, we only extract the sub-sitemap URLs themselves
-    — the caller would need to fetch those separately. For MVP,
-    we handle the common case of a flat sitemap.
+    is_index=True: `urls` are sub-sitemap URLs to fetch and recurse into.
+    These are NEVER filtered by filter_path here — a sub-sitemap's own
+    filename routinely has nothing to do with the topic it contains (e.g.
+    NIDDK's real weight-management pages live inside a file literally
+    named "sitemap-sc.xml"), so filtering at this level would silently
+    drop sub-sitemaps that do contain matching content. filter_path is
+    only meaningful against actual content-page URLs, applied below.
+
+    is_index=False: `urls` are real content-page URLs, already filtered
+    by filter_path.
     """
-    urls: list[str] = []
     try:
         root = ElementTree.fromstring(xml_text)
     except ElementTree.ParseError as exc:
         logger.error("sitemap XML parse error: %s", exc)
-        return []
+        return [], False
 
     # Check if this is a sitemap index
     sitemaps = root.findall("sm:sitemap/sm:loc", _NS)
     if sitemaps:
-        # This is a sitemap index — extract sub-sitemap URLs
-        # For now, just return the sub-sitemap URLs that match the filter
-        # The caller can iterate on these
-        logger.info("sitemap: found sitemap index with %d sub-sitemaps", len(sitemaps))
-        # We can't recursively fetch sub-sitemaps in this call,
-        # so return the sub-sitemap URLs that might contain our content
-        for sm in sitemaps:
-            loc = sm.text
-            if loc and (not filter_path or filter_path.lstrip("/") in loc):
-                urls.append(loc.strip())
-        return urls
+        urls = [sm.text.strip() for sm in sitemaps if sm.text]
+        logger.info("sitemap: found sitemap index with %d sub-sitemaps", len(urls))
+        return urls, True
 
     # Regular sitemap — extract <url><loc> entries
+    urls = []
     for url_el in root.findall("sm:url", _NS):
         loc = url_el.find("sm:loc", _NS)
         if loc is not None and loc.text:
@@ -142,7 +152,7 @@ def _parse_sitemap(xml_text: str, filter_path: str) -> list[str]:
                 urls.append(url)
 
     logger.info("sitemap: found %d matching URLs (filter: '%s')", len(urls), filter_path)
-    return urls
+    return urls, False
 
 
 def _extract_page(soup: BeautifulSoup, url: str) -> CollectedItem | None:

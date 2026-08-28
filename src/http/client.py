@@ -28,6 +28,12 @@ class TokenBucket:
         self.last_refill = time.monotonic()
         self._lock = asyncio.Lock()
 
+    def update_rate(self, new_rate: float) -> None:
+        """Adjust the refill rate live (e.g. from a server-advertised rate
+        limit header) without resetting current token count/timing."""
+        self.rate = new_rate
+        self.capacity = max(new_rate * 5, 1)
+
     async def acquire(self) -> None:
         async with self._lock:
             now = time.monotonic()
@@ -84,10 +90,15 @@ class CircuitBreaker:
 DOMAIN_RATE_LIMITS: dict[str, float] = {
     "reddit.com": 60,
     "pubmed.ncbi.nlm.nih.gov": 10,  # human-readable article pages (enrich_fulltext)
-    "eutils.ncbi.nlm.nih.gov": 10,  # the ACTUAL PubMed API domain — was missing
+    "eutils.ncbi.nlm.nih.gov": 180,  # the ACTUAL PubMed API domain — was missing
     # (pubmed.py calls eutils.ncbi.nlm.nih.gov, not pubmed.ncbi.nlm.nih.gov;
     # without this entry every real esearch/efetch call silently fell back
-    # to DEFAULT_RATE_LIMIT instead of the intended 10 rpm)
+    # to DEFAULT_RATE_LIMIT). 180rpm = NCBI's own documented no-API-key limit
+    # (3 req/sec, confirmed 2026-08-27 via https://www.ncbi.nlm.nih.gov/books/NBK25497/
+    # — "no more than three URL requests per second"). Was set to 10rpm before,
+    # 18x under NCBI's own stated ceiling. A free NCBI API key (PUBMED_API_KEY
+    # in .env, currently empty, already wired up in pubmed.py) would raise
+    # NCBI's own limit further to 10 req/sec (600rpm) if one is added later.
     "ebi.ac.uk": 10,
     "api.semanticscholar.org": 20,
     "api.crossref.org": 50,
@@ -95,6 +106,10 @@ DOMAIN_RATE_LIMITS: dict[str, float] = {
     "doaj.org": 2,
     "en.wikipedia.org": 60,
     "api.openalex.org": 60,
+    "api.unpaywall.org": 60,  # was missing entirely (silently on the 20rpm
+    # default) despite Unpaywall's own published guidance tolerating far
+    # more (~100k requests/day ≈ 69rpm sustained) — 60 stays conservatively
+    # under that ceiling.
     "clinicaltrials.gov": 20,
     "api.core.ac.uk": 10,
     "newsapi.org": 0.07,  # free tier: 100 req/day ≈ 0.07 rpm
@@ -141,6 +156,41 @@ def _rpm_to_rps(rpm: float) -> float:
     return rpm / 60.0
 
 
+def _parse_rate_limit_headers(headers: httpx.Headers) -> float | None:
+    """Parse Crossref-style X-Rate-Limit-Limit / X-Rate-Limit-Interval
+    response headers into a requests-per-second rate.
+
+    Crossref deliberately does NOT publish a fixed rate limit — their docs
+    state it varies over time and must be read from these two headers on
+    every response instead (confirmed 2026-08-27 via
+    https://github.com/CrossRef/rest-api-doc#etiquette). Other providers we
+    talk to don't send these headers, so this only ever fires for domains
+    that actually advertise it — everyone else keeps their static
+    DOMAIN_RATE_LIMITS entry untouched.
+
+    Interval is documented as e.g. "1s" — a number followed by a unit
+    letter (s=seconds, m=minutes, h=hours). Returns None if the headers are
+    absent or don't parse cleanly (never raises — a malformed/unexpected
+    header value should never break a real request).
+    """
+    limit = headers.get("X-Rate-Limit-Limit")
+    interval = headers.get("X-Rate-Limit-Interval")
+    if not limit or not interval:
+        return None
+    try:
+        limit_val = float(limit)
+        unit_seconds = {"s": 1, "m": 60, "h": 3600}.get(interval[-1].lower())
+        if unit_seconds is None:
+            interval_val = float(interval)  # no unit suffix — assume seconds
+        else:
+            interval_val = float(interval[:-1]) * unit_seconds
+        if interval_val <= 0:
+            return None
+        return limit_val / interval_val
+    except (ValueError, IndexError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # robots.txt cache
 # ---------------------------------------------------------------------------
@@ -179,9 +229,26 @@ class RateLimitedClient:
         self._buckets: dict[str, TokenBucket] = {}
         self._semaphores: dict[str, asyncio.Semaphore] = {}
         self._breakers: dict[str, CircuitBreaker] = {}
+        self._server_advertised_rps: dict[str, float] = {}  # last value applied, to log only on change
         self._client = httpx.AsyncClient(
             follow_redirects=True,
             timeout=httpx.Timeout(30.0),
+        )
+
+    def _apply_server_rate_limit(self, domain: str, resp: httpx.Response) -> None:
+        """If this response carries Crossref-style rate-limit headers, adapt
+        this domain's TokenBucket to it live instead of relying on the
+        static DOMAIN_RATE_LIMITS guess (see _parse_rate_limit_headers)."""
+        new_rps = _parse_rate_limit_headers(resp.headers)
+        if new_rps is None:
+            return
+        if self._server_advertised_rps.get(domain) == new_rps:
+            return  # unchanged since last time — nothing to do or log
+        self._server_advertised_rps[domain] = new_rps
+        self._bucket(domain).update_rate(new_rps)
+        logger.info(
+            "%s advertised its own rate limit via response headers: %.2f req/s (%.0f rpm) — applied live",
+            domain, new_rps, new_rps * 60,
         )
 
     def _bucket(self, domain: str) -> TokenBucket:
@@ -248,6 +315,12 @@ class RateLimitedClient:
                     # of where it redirects.
                     final_domain = _domain(str(resp.url))
                     outcome_breaker = self._breaker(final_domain) if final_domain != domain else breaker
+                    # Applied against the REQUESTED domain's bucket (`domain`),
+                    # since that's what acquire() actually throttles against —
+                    # not final_domain, which for a redirecting request (e.g.
+                    # doi.org) is a different server that never saw our token
+                    # bucket at all.
+                    self._apply_server_rate_limit(domain, resp)
 
                     if resp.status_code in range(200, 300) or resp.status_code == 304:
                         outcome_breaker.record_success()

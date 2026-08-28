@@ -9,7 +9,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urldefrag
 
-from sqlalchemy import select, update, text, case, desc, cast, String
+from sqlalchemy import select, update, text, case, desc, cast, String, func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -242,11 +242,22 @@ async def _merge_tag_list(
     if not url:
         return sorted(new_set)
     try:
-        result = await session.execute(
-            text(f"SELECT {column} FROM crawled_items WHERE url = :url"),
-            {"url": url},
-        )
-        row = result.first()
+        # BUG FIXED 2026-08-27: this is called TWICE per item in save_items()'s
+        # main loop (once for domain_tags, once for topic_tags) — the busiest
+        # call site in the whole ingest path. It caught its own exceptions but
+        # never rolled back, so any failure here left the session's underlying
+        # transaction ABORTED while Python-level control flow continued as if
+        # nothing happened; every subsequent INSERT in the same batch then
+        # failed too, with a confusing unrelated error (the exact
+        # "InFailedSQLTransactionError" failure mode already root-caused once
+        # for clinicaltrials_* — see save_items()'s re-embedding trigger fix).
+        # A SAVEPOINT here contains any failure to just this one lookup.
+        async with session.begin_nested():
+            result = await session.execute(
+                text(f"SELECT {column} FROM crawled_items WHERE url = :url"),
+                {"url": url},
+            )
+            row = result.first()
     except Exception as exc:
         logger.debug("_merge_tag_list(%s) lookup failed (non-critical): %s", column, exc)
         return sorted(new_set)
@@ -303,6 +314,16 @@ async def save_items(
 
         # P2-E: quality gate — discard junk content_body but keep metadata
         content_body = item.get("content_body")
+        # Strip NUL bytes — Postgres UTF8 text columns reject them outright
+        # (CharacterNotInRepertoireError). Any collector that scrapes a live
+        # page/PDF can hit this (confirmed for enrich_fulltext's PDF parsing
+        # — see _sanitize() there — but html_crawl/playwright_crawl/sitemap/
+        # rss all feed content_body through this SAME path too), and unlike
+        # enrich_fulltext this loop only caught IntegrityError, not a general
+        # DBAPIError — so this would have silently discarded the ENTIRE
+        # batch of items from this surface's poll, not just the bad one.
+        if content_body:
+            content_body = content_body.replace("\x00", "")
         if not _passes_quality_gate(content_body):
             content_body = None
 
@@ -380,9 +401,28 @@ async def save_items(
                 "engagement": stmt.excluded.engagement,
                 "rank_position": stmt.excluded.rank_position,
                 "description": stmt.excluded.description,
-                "content_body": stmt.excluded.content_body,
-                "content_hash": stmt.excluded.content_hash,
-                "content_updated_at": stmt.excluded.content_updated_at,
+                # BUG FIXED 2026-08-27: these three used to be a bare
+                # overwrite with stmt.excluded.*. Most academic collectors
+                # (pubmed/crossref/europepmc/openalex/doaj/semanticscholar/
+                # biorxiv/core) set content_body=None at collection time —
+                # full text is only filled in LATER by enrich_fulltext().
+                # If the SAME surface later re-discovers the same URL (a
+                # normal, common occurrence — polling the same query finds
+                # overlapping results), the new row's content_body is None
+                # again, and the bare overwrite silently WIPED OUT whatever
+                # real full text enrich_fulltext had already fetched,
+                # putting a real, downloaded article back to square one
+                # (and, if that domain had since been given up on, losing
+                # it permanently). Confirmed live: option 10's total
+                # full-article count visibly dropped between two checks a
+                # few minutes apart with no corresponding code change.
+                # COALESCE keeps the existing value whenever the new
+                # collection pass didn't actually find anything —  a
+                # re-collect can still legitimately UPDATE content (e.g. a
+                # changed guideline page), it just can't blank it out.
+                "content_body": func.coalesce(stmt.excluded.content_body, CrawledItem.content_body),
+                "content_hash": func.coalesce(stmt.excluded.content_hash, CrawledItem.content_hash),
+                "content_updated_at": func.coalesce(stmt.excluded.content_updated_at, CrawledItem.content_updated_at),
                 "collected_at": stmt.excluded.collected_at,
                 "authority_tier": stmt.excluded.authority_tier,
                 "source_type": stmt.excluded.source_type,
@@ -402,14 +442,29 @@ async def save_items(
         )
 
         try:
-            result = await session.execute(stmt)
-            # rowcount == 1 on insert, 0 on update (DO UPDATE with no change)
-            if result.rowcount == 1:
-                inserted += 1
+            # BUG FIXED 2026-08-27: was `except IntegrityError: await
+            # session.rollback()` — a bare (non-nested) rollback() here
+            # discards the WHOLE transaction, not just this one item. Since
+            # this loop shares one session across the whole batch (committed
+            # once at the end), one item hitting a DOI conflict wiped out
+            # every OTHER item already upserted earlier in the same loop
+            # iteration too, not just itself. Also widened from
+            # IntegrityError-only to any DBAPIError, since a stray NUL byte
+            # (or other encoding oddity) that slips past the sanitization
+            # above raises a different exception class and was previously
+            # uncaught here — able to abort the session for every item
+            # still to come in this same batch.
+            async with session.begin_nested():
+                result = await session.execute(stmt)
+                # rowcount == 1 on insert, 0 on update (DO UPDATE with no change)
+                if result.rowcount == 1:
+                    inserted += 1
         except IntegrityError:
             # DOI unique constraint conflict (same DOI at different URL)
-            await session.rollback()
             logger.debug("DOI conflict skipped for url=%s doi=%s", url, item.get("doi"))
+            continue
+        except Exception as exc:
+            logger.warning("save_items: upsert failed for url=%s, skipping just this item: %s", url, exc)
             continue
 
     try:
@@ -490,7 +545,18 @@ async def enrich_unpaywall(session: AsyncSession, batch_size: int = 300) -> int:
 
     Also backfills oa_url for existing open_access=True records that
     have no oa_url set (records collected before migration 0004).
+
+    Fetches the whole batch concurrently (was a plain sequential loop) —
+    api.unpaywall.org now has its own DOMAIN_RATE_LIMITS entry (60 rpm,
+    was silently defaulting to 20 rpm) in src/http/client.py, and this is
+    a single lightweight JSON call per DOI with no CPU-bound work, so
+    concurrency alone (no process pool needed, unlike enrich_fulltext's
+    PDF parsing) is enough to actually use that higher rate. Real
+    measured duration for batch_size=300 was already ~7-8 min even
+    sequentially at the old 20rpm cap — this is meant to bring that
+    down, not to push total throughput past what Unpaywall tolerates.
     """
+    import asyncio
     from src.config import settings
     from src.http.client import get_shared_client
 
@@ -519,14 +585,35 @@ async def enrich_unpaywall(session: AsyncSession, batch_size: int = 300) -> int:
         .limit(batch_size)
     )
     rows = result.fetchall()
+    if not rows:
+        return 0
 
-    for row_id, doi in rows:
+    async def _check(row_id, doi):
         api_url = f"https://api.unpaywall.org/v2/{doi}?email={settings.CRAWLER_EMAIL}"
         try:
             resp = await client.get(api_url)
-            data = resp.json()
+            return (row_id, resp.json(), None)
         except Exception as exc:
-            logger.debug("Unpaywall failed for doi=%s: %s", doi, exc)
+            return (row_id, None, exc)
+
+    results = await asyncio.gather(*(_check(rid, doi) for rid, doi in rows))
+
+    # Sequential writes (AsyncSession isn't safe for concurrent use), each in
+    # its own SAVEPOINT so one malformed response can't poison the rest of
+    # the batch's writes — same pattern/rationale as enrich_fulltext's _write.
+    async def _write(row_id, is_oa, oa_url):
+        try:
+            async with session.begin_nested():
+                await session.execute(
+                    update(CrawledItem).where(CrawledItem.id == row_id)
+                    .values(open_access=is_oa, oa_url=oa_url)
+                )
+        except Exception as exc:
+            logger.warning("enrich_unpaywall: write failed for row %s, skipping just this row: %s", row_id, exc)
+
+    for row_id, data, exc in results:
+        if data is None:
+            logger.debug("Unpaywall failed for row=%s: %s", row_id, exc)
             continue
 
         is_oa = data.get("is_oa", False)
@@ -539,11 +626,7 @@ async def enrich_unpaywall(session: AsyncSession, batch_size: int = 300) -> int:
         # kept matching this query's WHERE clause — re-checked every single cycle,
         # starving new records out of the batch. That was the main reason the
         # backlog never shrank despite running every 6 hours.
-        await session.execute(
-            update(CrawledItem)
-            .where(CrawledItem.id == row_id)
-            .values(open_access=is_oa, oa_url=oa_url)
-        )
+        await _write(row_id, is_oa, oa_url)
         if is_oa or oa_url:
             updated += 1
 
@@ -682,17 +765,58 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
     if not rows:
         return 0
 
+    # Instrumentation added 2026-08-27: the only prior visibility into this
+    # function was one summary line ("enriched N records") logged AFTER the
+    # entire batch finished — no way to tell whether successes landed in the
+    # first few minutes and the rest of the cycle (5-25 min, measured) was
+    # dead weight, or were spread through the whole thing. httpx's own
+    # per-request log lines don't help either — they're not tagged as
+    # belonging to this function, and are interleaved with every other
+    # concurrent surface's requests. This logs real-time progress so that
+    # question is actually answerable from crawler.log going forward.
+    import time as _time
+    batch_start = _time.monotonic()
+    logger.info(
+        "enrich_fulltext: starting batch of %d items (%d domains already given up, "
+        "skipped without a request)",
+        len(rows), len(given_up_domains),
+    )
+    _progress = {"done": 0, "success": 0, "given_up_skip": 0, "failed": 0}
+
     # ── Stage 1: concurrent download ──────────────────────────────────────
     async def _fetch(row_id, oa_url):
-        if _domain_of(oa_url) in given_up_domains:
-            return (row_id, oa_url, None, _DomainGivenUp(_domain_of(oa_url)))
         try:
-            resp = await client.get(oa_url, use_browser_ua=True)
-            return (row_id, oa_url, resp, None)
-        except Exception as exc:
-            return (row_id, oa_url, None, exc)
+            if _domain_of(oa_url) in given_up_domains:
+                _progress["given_up_skip"] += 1
+                return (row_id, oa_url, None, _DomainGivenUp(_domain_of(oa_url)))
+            try:
+                resp = await client.get(oa_url, use_browser_ua=True)
+                _progress["success" if resp.status_code < 400 else "failed"] += 1
+                return (row_id, oa_url, resp, None)
+            except Exception as exc:
+                _progress["failed"] += 1
+                return (row_id, oa_url, None, exc)
+        finally:
+            _progress["done"] += 1
+            # Every 25 completions (not every single one — 300/cycle would be
+            # too noisy), log a timestamped snapshot of how far through the
+            # batch we are and how the outcomes are splitting so far. This is
+            # what actually answers "front-loaded or spread out": compare the
+            # elapsed-seconds column across consecutive lines.
+            if _progress["done"] % 25 == 0 or _progress["done"] == len(rows):
+                elapsed = _time.monotonic() - batch_start
+                logger.info(
+                    "enrich_fulltext: progress %d/%d done at %.0fs elapsed "
+                    "(success=%d given_up_skip=%d failed=%d)",
+                    _progress["done"], len(rows), elapsed,
+                    _progress["success"], _progress["given_up_skip"], _progress["failed"],
+                )
 
     fetched = await asyncio.gather(*(_fetch(rid, url) for rid, url in rows))
+    logger.info(
+        "enrich_fulltext: all %d fetches done after %.0fs — parsing + writing next",
+        len(rows), _time.monotonic() - batch_start,
+    )
 
     # ── Track consecutive 403s per domain, across this batch AND prior
     #    cycles (the counter is persisted in blocked_domains) ──────────────
@@ -821,7 +945,22 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
             # way, this is now a permanent verdict, not a transient failure:
             # write '' so it stops occupying a queue slot, instead of NULL
             # (which would just retry — and re-fail — every future cycle).
-            if isinstance(fetch_exc, _DomainGivenUp) or final_domain in newly_given_up:
+            # BUG FIXED 2026-08-27: this previously only checked
+            # `final_domain in newly_given_up` (crossed the threshold THIS
+            # cycle) — it forgot `given_up_domains` (crossed in an EARLIER
+            # cycle). A row whose oa_url is a redirector (e.g. doi.org)
+            # that lands on an already-given-up publisher was never caught
+            # by the pre-fetch check (which only sees the requested domain,
+            # doi.org, not the eventual destination) NOR by this one — so it
+            # kept getting a real fetch attempt, a real 403, and was left
+            # NULL forever, retried every single cycle indefinitely. Found
+            # by watching a "given up" domain's consecutive_403_count keep
+            # climbing (to 1370+) long after it was already given up.
+            if (
+                isinstance(fetch_exc, _DomainGivenUp)
+                or final_domain in newly_given_up
+                or final_domain in given_up_domains
+            ):
                 await _write(row_id, "")
                 continue
             logger.debug("enrich_fulltext: fetch failed for %s: %s", oa_url, fetch_exc)
@@ -895,14 +1034,17 @@ async def enrich_fulltext_loop() -> None:
             # Step 1: resolve OA URLs for items with DOI
             async with AsyncSessionLocal() as session:
                 oa_count = await enrich_unpaywall(session)
-                if oa_count:
-                    logger.info("enrich_unpaywall: resolved %d OA URLs", oa_count)
+                # Always log, even 0 — setup.sh option 10 reads the LAST such
+                # line to report "articles downloaded in the last cycle";
+                # skipping the log on a zero result would make it silently
+                # show a stale count from whichever earlier cycle last had
+                # a nonzero result, instead of the true, most recent one.
+                logger.info("enrich_unpaywall: resolved %d OA URLs", oa_count)
 
             # Step 2: fetch full text for items that now have an OA URL
             async with AsyncSessionLocal() as session:
                 ft_count = await enrich_fulltext(session)
-                if ft_count:
-                    logger.info("enrich_fulltext: enriched %d records with full text", ft_count)
+                logger.info("enrich_fulltext: enriched %d records with full text", ft_count)
         except Exception as exc:
             logger.error("enrich_fulltext loop error: %s", exc)
         await _asyncio.sleep(_interval)

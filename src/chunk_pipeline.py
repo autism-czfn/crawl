@@ -121,79 +121,94 @@ async def run_once(max_items: int = _BATCH_SIZE) -> int:
             domain_tags = row.domain_tags
             topic_tags = row.topic_tags
 
-            # Delete stale chunks if this is a re-chunk pass
-            if row in rechunk_rows:
-                await session.execute(
-                    delete(Chunk).where(Chunk.crawled_item_id == item_id)
-                )
+            # BUG FIXED 2026-08-27: this whole per-item body used to run with
+            # no isolation on the batch's one shared session — if ANY single
+            # item's chunk_text (e.g. a stray NUL byte Postgres rejects
+            # outright, or any other DB error) failed, the exception
+            # propagated out of the entire `for row in rows:` loop and past
+            # the final `session.commit()`, silently discarding chunking
+            # work for EVERY item in the batch (up to 200), not just the bad
+            # one — same failure class already found/fixed in save_items()
+            # and enrich_fulltext(). A SAVEPOINT scopes any failure to just
+            # this one item.
+            try:
+                async with session.begin_nested():
+                    # Delete stale chunks if this is a re-chunk pass
+                    if row in rechunk_rows:
+                        await session.execute(
+                            delete(Chunk).where(Chunk.crawled_item_id == item_id)
+                        )
 
-            chunks = chunk_text(content_body)
-            if not chunks:
-                # Still clear the needs_rechunk flag
-                await session.execute(
-                    update(CrawledItem)
-                    .where(CrawledItem.id == item_id)
-                    .values(needs_rechunk=False)
-                )
+                    chunks = chunk_text(content_body)
+                    if not chunks:
+                        # Still clear the needs_rechunk flag
+                        await session.execute(
+                            update(CrawledItem)
+                            .where(CrawledItem.id == item_id)
+                            .values(needs_rechunk=False)
+                        )
+                        continue
+
+                    # Insert regular chunks with metadata
+                    # TODO: section_heading and heading_path will be populated in a future sprint
+                    # when raw HTML is stored. Currently content_body is plain text (HTML stripped),
+                    # so heading structure cannot be re-extracted at chunk time.
+                    for idx, chunk_text_val in enumerate(chunks):
+                        stmt = insert(Chunk).values(
+                            crawled_item_id=item_id,
+                            chunk_index=idx,
+                            chunk_text=chunk_text_val,
+                            title=title,
+                            url=url,
+                            domain=domain,
+                            source_type=source_type,
+                            authority_tier=authority_tier,
+                            published_at=published_at,
+                            lang=lang,
+                            domain_tags=domain_tags,
+                            topic_tags=topic_tags,
+                            is_summary=False,
+                            section_heading=None,
+                            heading_path=None,
+                        )
+                        # Skip if chunk already exists (idempotent for new-row pass)
+                        stmt = stmt.on_conflict_do_nothing()
+                        await session.execute(stmt)
+
+                    # Sprint 4-A/B: insert summary chunk (document-level embedding anchor)
+                    summary_text = f"{title or ''} {content_body[:500]}".strip()
+                    if summary_text:
+                        summary_stmt = insert(Chunk).values(
+                            crawled_item_id=item_id,
+                            chunk_index=-1,
+                            chunk_text=summary_text,
+                            title=title,
+                            url=url,
+                            domain=domain,
+                            source_type=source_type,
+                            authority_tier=authority_tier,
+                            published_at=published_at,
+                            lang=lang,
+                            domain_tags=domain_tags,
+                            topic_tags=topic_tags,
+                            is_summary=True,
+                            section_heading=None,
+                            heading_path=None,
+                        )
+                        summary_stmt = summary_stmt.on_conflict_do_nothing()
+                        await session.execute(summary_stmt)
+
+                    # Clear needs_rechunk flag
+                    await session.execute(
+                        update(CrawledItem)
+                        .where(CrawledItem.id == item_id)
+                        .values(needs_rechunk=False)
+                    )
+
+                    total_chunked += 1
+            except Exception as exc:
+                logger.warning("chunk_pipeline: failed for item %s, skipping just this item: %s", item_id, exc)
                 continue
-
-            # Insert regular chunks with metadata
-            # TODO: section_heading and heading_path will be populated in a future sprint
-            # when raw HTML is stored. Currently content_body is plain text (HTML stripped),
-            # so heading structure cannot be re-extracted at chunk time.
-            for idx, chunk_text_val in enumerate(chunks):
-                stmt = insert(Chunk).values(
-                    crawled_item_id=item_id,
-                    chunk_index=idx,
-                    chunk_text=chunk_text_val,
-                    title=title,
-                    url=url,
-                    domain=domain,
-                    source_type=source_type,
-                    authority_tier=authority_tier,
-                    published_at=published_at,
-                    lang=lang,
-                    domain_tags=domain_tags,
-                    topic_tags=topic_tags,
-                    is_summary=False,
-                    section_heading=None,
-                    heading_path=None,
-                )
-                # Skip if chunk already exists (idempotent for new-row pass)
-                stmt = stmt.on_conflict_do_nothing()
-                await session.execute(stmt)
-
-            # Sprint 4-A/B: insert summary chunk (document-level embedding anchor)
-            summary_text = f"{title or ''} {content_body[:500]}".strip()
-            if summary_text:
-                summary_stmt = insert(Chunk).values(
-                    crawled_item_id=item_id,
-                    chunk_index=-1,
-                    chunk_text=summary_text,
-                    title=title,
-                    url=url,
-                    domain=domain,
-                    source_type=source_type,
-                    authority_tier=authority_tier,
-                    published_at=published_at,
-                    lang=lang,
-                    domain_tags=domain_tags,
-                    topic_tags=topic_tags,
-                    is_summary=True,
-                    section_heading=None,
-                    heading_path=None,
-                )
-                summary_stmt = summary_stmt.on_conflict_do_nothing()
-                await session.execute(summary_stmt)
-
-            # Clear needs_rechunk flag
-            await session.execute(
-                update(CrawledItem)
-                .where(CrawledItem.id == item_id)
-                .values(needs_rechunk=False)
-            )
-
-            total_chunked += 1
 
         await session.commit()
 
