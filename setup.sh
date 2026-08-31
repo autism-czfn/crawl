@@ -26,7 +26,7 @@ LOG_FILE="$PROJECT_DIR/crawler.log"
 ADMIN_LOG_FILE="$PROJECT_DIR/admin.log"
 ADMIN_PORT="${ADMIN_PORT:-8001}"
 PYTHON="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}"
-PYTHON="${PYTHON:-$(command -v python)}"
+PYTHON="${PYTHON:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null)}"
 
 # ── Checks ─────────────────────────────────────────────────────────────────────
 check_python() {
@@ -72,7 +72,7 @@ update_csrf_origins() {
     local origins="https://${public_ip},http://127.0.0.1,http://localhost"
 
     if grep -q "^DJANGO_CSRF_TRUSTED_ORIGINS=" .env; then
-        sed -i "s|^DJANGO_CSRF_TRUSTED_ORIGINS=.*|DJANGO_CSRF_TRUSTED_ORIGINS=${origins}|" .env
+        sed -i '' "s|^DJANGO_CSRF_TRUSTED_ORIGINS=.*|DJANGO_CSRF_TRUSTED_ORIGINS=${origins}|" .env
     else
         echo "DJANGO_CSRF_TRUSTED_ORIGINS=${origins}" >> .env
     fi
@@ -91,31 +91,90 @@ run_migrations() {
 }
 
 # ── PID helpers ────────────────────────────────────────────────────────────────
+# Pattern used to identify the crawler process regardless of who started it.
+# Must NOT start with "-" or pgrep will treat it as a flag.
+CRAWLER_PGREP_PATTERN="src[.]main"
+ADMIN_PGREP_PATTERN="admin_site/manage[.]py.*runserver"
+
+# Find the crawler PID by looking for a Python process launched with "-m src.main".
+# Matching " -m src.main" (with space, without a colon suffix) avoids false
+# positives from uvicorn apps whose module path also contains "src.main:app".
+_find_crawler_pid() {
+    ps -eo pid=,command= 2>/dev/null \
+        | awk '$2 ~ /python/ && / -m src[.]main( |$)/ {print $1}' \
+        | head -1
+}
+
+# Find the Django admin PID — always return the PARENT (reloader) process.
+# runserver spawns two processes: a file-watcher parent and an HTTP-server child.
+# Killing the parent takes down both; killing only the child causes the parent
+# to immediately respawn it.  sort -n gives lowest PID = the parent.
+_find_admin_pid() {
+    ps -eo pid=,command= 2>/dev/null \
+        | awk '$2 ~ /python/ && /admin_site\/manage[.]py/ && /runserver/ {print $1}' \
+        | sort -n \
+        | head -1
+}
+
 is_running() {
+    # 1. PID file exists — check the process is alive AND is actually the crawler.
+    #    (The file may contain a stale PID from a shell wrapper, not a python process.)
     if [[ -f "$PID_FILE" ]]; then
         local pid
         pid=$(cat "$PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
-            return 0   # running
+            # Validate: the stored PID must be a python -m src.main process.
+            if ps -p "$pid" -o command= 2>/dev/null \
+               | awk '$1 ~ /python/ && / -m src[.]main( |$)/ {found=1} END {exit !found}'; then
+                return 0   # running, PID file is valid
+            fi
         fi
+        # Dead or wrong process — discard the stale file and fall through.
+        rm -f "$PID_FILE"
     fi
+
+    # 2. Fallback: find by process scan (handles processes started by other
+    #    parents, e.g. a Claude agent).  Adopt the PID so the rest of the
+    #    script can manage it normally.
+    local found_pid
+    found_pid=$(_find_crawler_pid)
+    if [[ -n "$found_pid" ]]; then
+        echo "$found_pid" > "$PID_FILE"   # adopt externally-started process
+        return 0
+    fi
+
     return 1   # not running
 }
 
 stop_existing() {
-    if is_running; then
+    # Refresh / adopt PID before stopping.
+    is_running || true
+
+    if [[ -f "$PID_FILE" ]]; then
         local pid
         pid=$(cat "$PID_FILE")
         warn "Stopping existing crawler process (PID $pid) ..."
-        kill "$pid"
-        # Wait up to 10 s for clean exit
+        kill "$pid" 2>/dev/null || true
+        # Wait up to 10 s for clean exit.
         local i=0
         while kill -0 "$pid" 2>/dev/null && [[ $i -lt 10 ]]; do
             sleep 1; i=$((i + 1))
         done
-        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" || true
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
         rm -f "$PID_FILE"
         success "Stopped."
+    fi
+
+    # Kill any additional stragglers that share the same command pattern
+    # (e.g. child worker processes spawned by the main process).
+    local stragglers
+    stragglers=$(pgrep -f "$CRAWLER_PGREP_PATTERN" 2>/dev/null || true)
+    if [[ -n "$stragglers" ]]; then
+        warn "Killing remaining crawler processes: $(echo "$stragglers" | tr '\n' ' ')"
+        echo "$stragglers" | xargs kill 2>/dev/null || true
+        sleep 2
+        stragglers=$(pgrep -f "$CRAWLER_PGREP_PATTERN" 2>/dev/null || true)
+        [[ -n "$stragglers" ]] && echo "$stragglers" | xargs kill -9 2>/dev/null || true
     fi
 }
 
@@ -165,7 +224,7 @@ start_restart_all() {
     sleep 2
     if kill -0 "$admin_pid" 2>/dev/null; then
         local public_ip
-        public_ip=$(grep "^DJANGO_CSRF_TRUSTED_ORIGINS=" .env | grep -oP 'https://\K[^,]+' | head -1)
+        public_ip=$(grep "^DJANGO_CSRF_TRUSTED_ORIGINS=" .env | sed 's/.*https:\/\/\([^,]*\).*/\1/' | head -1)
         success "Django admin started  (PID $admin_pid)  →  https://${public_ip}/admin/"
     else
         error "Django admin exited immediately. Check logs:"
@@ -188,31 +247,83 @@ only_migrate() {
     echo
 }
 
+# ── Option 9 — Run test suite ──────────────────────────────────────────────────
+run_tests() {
+    echo
+    if ! "$PYTHON" -m pytest --version &>/dev/null; then
+        warn "pytest not found — installing test dependencies ..."
+        pip install --quiet pytest pytest-asyncio
+    fi
+
+    info "Running test suite (tests/) ..."
+    echo
+    # Not `check_env`-gated and no `run_migrations` — the suite is pure unit
+    # tests (no live DB/network calls), so it works even before first setup.
+    # Guarded with if/then, not bare `set -e`, so a failing test reports a
+    # clear summary instead of silently killing the whole menu loop.
+    if "$PYTHON" -m pytest tests/ -v; then
+        echo
+        success "All tests passed."
+    else
+        echo
+        error "Some tests failed — see output above."
+    fi
+    echo
+}
+
 # ── Django admin PID helpers ───────────────────────────────────────────────────
 is_admin_running() {
+    # 1. PID file exists — validate it's alive AND is actually the Django admin.
     if [[ -f "$ADMIN_PID_FILE" ]]; then
         local pid
         pid=$(cat "$ADMIN_PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
-            return 0
+            if ps -p "$pid" -o command= 2>/dev/null \
+               | awk '$1 ~ /python/ && /admin_site\/manage[.]py/ && /runserver/ {found=1} END {exit !found}'; then
+                return 0
+            fi
         fi
+        rm -f "$ADMIN_PID_FILE"
     fi
+
+    # 2. Process-scan fallback — adopt externally-started admin process.
+    local found_pid
+    found_pid=$(_find_admin_pid)
+    if [[ -n "$found_pid" ]]; then
+        echo "$found_pid" > "$ADMIN_PID_FILE"   # adopt externally-started process
+        return 0
+    fi
+
     return 1
 }
 
 stop_existing_admin() {
-    if is_admin_running; then
+    # Refresh / adopt PID before stopping.
+    is_admin_running || true
+
+    if [[ -f "$ADMIN_PID_FILE" ]]; then
         local pid
         pid=$(cat "$ADMIN_PID_FILE")
         warn "Stopping existing Django admin process (PID $pid) ..."
-        kill "$pid"
+        kill "$pid" 2>/dev/null || true
         local i=0
         while kill -0 "$pid" 2>/dev/null && [[ $i -lt 10 ]]; do
             sleep 1; i=$((i + 1))
         done
-        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" || true
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
         rm -f "$ADMIN_PID_FILE"
         success "Stopped."
+    fi
+
+    # Kill any stragglers.
+    local stragglers
+    stragglers=$(pgrep -f "$ADMIN_PGREP_PATTERN" 2>/dev/null || true)
+    if [[ -n "$stragglers" ]]; then
+        warn "Killing remaining Django admin processes: $(echo "$stragglers" | tr '\n' ' ')"
+        echo "$stragglers" | xargs kill 2>/dev/null || true
+        sleep 2
+        stragglers=$(pgrep -f "$ADMIN_PGREP_PATTERN" 2>/dev/null || true)
+        [[ -n "$stragglers" ]] && echo "$stragglers" | xargs kill -9 2>/dev/null || true
     fi
 }
 
@@ -289,9 +400,8 @@ show_db_stats() {
         echo; return
     fi
 
-    # Use the project's own Python/psycopg2 — no psql needed
     "$PYTHON" - << 'PYEOF'
-import os, sys, json, pathlib
+import os, sys, json, pathlib, re
 
 # ── Load .env ──
 for line in pathlib.Path(".env").read_text().splitlines():
@@ -305,43 +415,372 @@ if not db_url:
     print("  \033[0;31m[ERROR]\033[0m  DATABASE_URL not set in .env")
     sys.exit(1)
 
-# Strip SQLAlchemy driver prefix (e.g. postgresql+asyncpg:// → postgresql://)
-import re
 db_url = re.sub(r"^(postgresql)\+\w+://", r"\1://", db_url)
 
 BOLD  = "\033[1m"
+DIM   = "\033[2m"
 GREEN = "\033[0;32m"
+CYAN  = "\033[0;36m"
 WARN  = "\033[1;33m"
-ERR   = "\033[0;31m"
 RESET = "\033[0m"
 
-# ── DB size & crawled items ──
-db_size = item_count = "N/A"
+def bar(n, total, width=20):
+    """Simple ASCII progress bar."""
+    if total == 0:
+        return "[" + "-" * width + "]"
+    filled = int(round(n / total * width))
+    return "[" + "█" * filled + "─" * (width - filled) + "]"
+
+def pct(n, total):
+    return f"{n/total*100:.0f}%" if total else "─"
+
 try:
     import psycopg2
     conn = psycopg2.connect(db_url)
     cur  = conn.cursor()
+
+    # ── Header: DB overview ───────────────────────────────────────────────────
     cur.execute("SELECT pg_size_pretty(pg_database_size(current_database()));")
     db_size = cur.fetchone()[0].strip()
+
     cur.execute("SELECT COUNT(*) FROM crawled_items;")
-    item_count = f"{cur.fetchone()[0]:,}"
+    total_items = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM chunks;")
+    total_chunks = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL;")
+    total_embedded = cur.fetchone()[0]
+
+    print(f"  {BOLD}DB size:{RESET}        {GREEN}{db_size}{RESET}")
+    print(f"  {BOLD}Total articles:{RESET} {GREEN}{total_items:,}{RESET}")
+    print(f"  {BOLD}Total chunks:{RESET}   {GREEN}{total_chunks:,}{RESET}  "
+          f"({GREEN}{total_embedded:,}{RESET} embedded / indexed)")
+    print()
+
+    # ── Load tier info from surfaces.json ─────────────────────────────────────
+    surfaces = json.loads(pathlib.Path("config/surfaces.json").read_text())
+    tier_by_key = {s["key"]: s.get("authority_tier") for s in surfaces}
+
+    # ── Per-source breakdown (tier 1 & 2 only) ────────────────────────────────
+    cur.execute("""
+        SELECT
+            ci.surface_key,
+            COUNT(*)                                            AS total,
+            COUNT(ci.content_body)                             AS has_content,
+            COUNT(CASE WHEN LENGTH(ci.content_body) >= 1000
+                       THEN 1 END)                             AS full_text,
+            COUNT(CASE WHEN ci.content_body IS NOT NULL
+                        AND LENGTH(ci.content_body) < 1000
+                       THEN 1 END)                             AS abstract_only,
+            COUNT(DISTINCT ch.crawled_item_id)                 AS chunked,
+            COUNT(CASE WHEN ch.embedding IS NOT NULL THEN 1 END) AS embedded
+        FROM crawled_items ci
+        LEFT JOIN chunks ch ON ch.crawled_item_id = ci.id
+        GROUP BY ci.surface_key
+        ORDER BY ci.surface_key;
+    """)
+    rows = cur.fetchall()
+    # {surface_key: (total, has_content, full_text, abstract_only, chunked, embedded)}
+    stats = {r[0]: r[1:] for r in rows}
+
+    for tier_label, tier_num in [("Tier 1  (Official / Government)", 1),
+                                  ("Tier 2  (Academic / Medical)", 2)]:
+        tier_keys = sorted([k for k, t in tier_by_key.items() if t == tier_num])
+        if not tier_keys:
+            continue
+
+        print(f"  {BOLD}{'─'*70}{RESET}")
+        print(f"  {BOLD}{CYAN}{tier_label}{RESET}")
+        print(f"  {BOLD}{'─'*70}{RESET}")
+        print(f"  {BOLD}{'Surface':<32} {'Total':>6} {'FullTxt':>7} {'Abstract':>8} "
+              f"{'Chunked':>7} {'Embedded':>8}  Coverage{RESET}")
+        print(f"  {'─'*32} {'─'*6} {'─'*7} {'─'*8} {'─'*7} {'─'*8}  {'─'*22}")
+
+        tier_total = tier_full = tier_abstract = tier_chunked = tier_embedded = 0
+
+        for key in tier_keys:
+            if key not in stats:
+                # Surface enabled but nothing crawled yet
+                print(f"  {key:<32} {'─':>6} {'─':>7} {'─':>8} {'─':>7} {'─':>8}  {DIM}no data yet{RESET}")
+                continue
+
+            total, has_content, full_text, abstract_only, chunked, embedded = stats[key]
+            tier_total    += total
+            tier_full     += full_text
+            tier_abstract += abstract_only
+            tier_chunked  += chunked
+            tier_embedded += embedded
+
+            emb_bar = bar(embedded, total)
+            print(f"  {key:<32} {total:>6,} {full_text:>7,} {abstract_only:>8,} "
+                  f"{chunked:>7,} {embedded:>8,}  {emb_bar} {pct(embedded,total):>4}")
+
+        print(f"  {'─'*32} {'─'*6} {'─'*7} {'─'*8} {'─'*7} {'─'*8}")
+        print(f"  {BOLD}{'SUBTOTAL':<32} {tier_total:>6,} {tier_full:>7,} "
+              f"{tier_abstract:>8,} {tier_chunked:>7,} {tier_embedded:>8,}{RESET}")
+        print()
+
+    # ── Embedding coverage summary ─────────────────────────────────────────────
+    cur.execute("""
+        SELECT COUNT(*) FROM crawled_items ci
+        WHERE EXISTS (SELECT 1 FROM chunks ch
+                      WHERE ch.crawled_item_id = ci.id
+                        AND ch.embedding IS NOT NULL);
+    """)
+    items_with_embeddings = cur.fetchone()[0]
+
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    print(f"  {BOLD}Vector index coverage{RESET}")
+    print(f"  {'─'*70}")
+    print(f"  Articles with ≥1 embedded chunk : "
+          f"{GREEN}{items_with_embeddings:,}{RESET} / {total_items:,}  "
+          f"({pct(items_with_embeddings, total_items)})")
+    print(f"  Chunks embedded / total         : "
+          f"{GREEN}{total_embedded:,}{RESET} / {total_chunks:,}  "
+          f"({pct(total_embedded, total_chunks)})")
+    print(f"  {bar(total_embedded, total_chunks, width=40)}")
+    print()
+
     cur.close()
     conn.close()
-except Exception as e:
-    print(f"  {WARN}[WARN]{RESET}   DB query failed: {e}")
 
-# ── Active sources from surfaces.json ──
-source_count = "N/A"
+except Exception as e:
+    import traceback
+    print(f"  {WARN}[WARN]{RESET}  DB query failed: {e}")
+    traceback.print_exc()
+PYEOF
+}
+
+# ── Option 10 — Show crawled full articles by track ───────────────────────────
+show_track_stats() {
+    echo
+    info "=== Crawled Full Articles by Track (Tier 1 & Tier 2) ==="
+    info "Report generated at (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
+    echo
+
+    if [[ ! -f .env ]]; then
+        error ".env not found — cannot determine DATABASE_URL."
+        echo; return
+    fi
+
+    "$PYTHON" - << 'PYEOF'
+import os, sys, pathlib, re
+
+# ── Load .env ──
+for line in pathlib.Path(".env").read_text().splitlines():
+    line = line.strip()
+    if line and not line.startswith("#") and "=" in line:
+        k, _, v = line.partition("=")
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+db_url = os.environ.get("DATABASE_URL", "")
+if not db_url:
+    print("  \033[0;31m[ERROR]\033[0m  DATABASE_URL not set in .env")
+    sys.exit(1)
+
+db_url = re.sub(r"^(postgresql)\+\w+://", r"\1://", db_url)
+
+BOLD  = "\033[1m"
+DIM   = "\033[2m"
+GREEN = "\033[0;32m"
+CYAN  = "\033[0;36m"
+WARN  = "\033[1;33m"
+RESET = "\033[0m"
+
+# "Full article" threshold matches show_db_stats (option 7): content_body
+# >= 1000 chars. Below that (but not NULL) is treated as abstract-only —
+# typical of academic-API sources before Unpaywall enrichment lands real
+# full text (see src/pipeline.py enrich_unpaywall/enrich_fulltext).
+FULL_TEXT_MIN_LEN = 1000
+
+def bar(n, total, width=20):
+    if total == 0:
+        return "[" + "-" * width + "]"
+    filled = int(round(n / total * width))
+    return "[" + "█" * filled + "─" * (width - filled) + "]"
+
+def pct(n, total):
+    return f"{n/total*100:.0f}%" if total else "─"
+
 try:
-    surfaces = json.loads(pathlib.Path("config/surfaces.json").read_text())
-    source_count = sum(1 for s in surfaces if s.get("enabled", True))
-except Exception as e:
-    print(f"  {WARN}[WARN]{RESET}   Could not read surfaces.json: {e}")
+    import psycopg2
+    conn = psycopg2.connect(db_url)
+    cur  = conn.cursor()
 
-print(f"  {BOLD}DB Size:       {RESET}{GREEN}{db_size}{RESET}")
-print(f"  {BOLD}Crawled Items: {RESET}{GREEN}{item_count}{RESET}")
-print(f"  {BOLD}Active Sources:{RESET}{GREEN}{source_count}{RESET}  (config/surfaces.json)")
-print()
+    # A track/domain_tag is unnested from the domain_tags jsonb array, same
+    # approach as the crawl_domain_tag_coverage view (migration 0020) — an
+    # item tagged ["sleep","eating"] is correctly counted under both, not
+    # just its first tag. Scoped to Tier 1/2 only, matching this project's
+    # standing focus (see crawl.txt).
+    cur.execute(f"""
+        SELECT
+            domain_value AS track,
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE LENGTH(content_body) >= {FULL_TEXT_MIN_LEN}) AS full_text,
+            COUNT(*) FILTER (WHERE content_body IS NOT NULL
+                              AND LENGTH(content_body) < {FULL_TEXT_MIN_LEN}) AS abstract_only,
+            COUNT(*) FILTER (WHERE authority_tier = 1) AS tier1_total,
+            COUNT(*) FILTER (WHERE authority_tier = 1
+                              AND LENGTH(content_body) >= {FULL_TEXT_MIN_LEN}) AS tier1_full,
+            COUNT(*) FILTER (WHERE authority_tier = 2) AS tier2_total,
+            COUNT(*) FILTER (WHERE authority_tier = 2
+                              AND LENGTH(content_body) >= {FULL_TEXT_MIN_LEN}) AS tier2_full
+        FROM crawled_items,
+             LATERAL jsonb_array_elements_text(
+                 COALESCE(domain_tags, '[]'::jsonb)
+             ) AS domain_value
+        WHERE authority_tier IN (1, 2)
+        GROUP BY domain_value
+        ORDER BY total DESC;
+    """)
+    rows = cur.fetchall()
+
+    if not rows:
+        print(f"  {WARN}No Tier 1/2 items with a domain_tags value found.{RESET}")
+    else:
+        print(f"  {BOLD}{'Track':<14} {'Total':>6} {'FullTxt':>7} {'Abstract':>8} "
+              f"{'T1 total':>8} {'T1 full':>7} {'T2 total':>8} {'T2 full':>7}  Coverage{RESET}")
+        print(f"  {'─'*14} {'─'*6} {'─'*7} {'─'*8} {'─'*8} {'─'*7} {'─'*8} {'─'*7}  {'─'*22}")
+
+        sum_total = sum_full = sum_abstract = 0
+        sum_t1_total = sum_t1_full = sum_t2_total = sum_t2_full = 0
+
+        for (track, total, full_text, abstract_only,
+             t1_total, t1_full, t2_total, t2_full) in rows:
+            cov_bar = bar(full_text, total)
+            print(f"  {track:<14} {total:>6,} {full_text:>7,} {abstract_only:>8,} "
+                  f"{t1_total:>8,} {t1_full:>7,} {t2_total:>8,} {t2_full:>7,}  "
+                  f"{cov_bar} {pct(full_text, total):>4}")
+            sum_total      += total
+            sum_full       += full_text
+            sum_abstract   += abstract_only
+            sum_t1_total   += t1_total
+            sum_t1_full    += t1_full
+            sum_t2_total   += t2_total
+            sum_t2_full    += t2_full
+
+        print(f"  {'─'*14} {'─'*6} {'─'*7} {'─'*8} {'─'*8} {'─'*7} {'─'*8} {'─'*7}")
+        print(f"  {BOLD}{'TOTAL':<14} {sum_total:>6,} {sum_full:>7,} {sum_abstract:>8,} "
+              f"{sum_t1_total:>8,} {sum_t1_full:>7,} {sum_t2_total:>8,} {sum_t2_full:>7,}{RESET}")
+
+        print()
+        print(f"  {DIM}\"Total\" counts an item once per track it's tagged with — an "
+              f"item tagged [\"sleep\",\"eating\"] counts under both, so the column "
+              f"(and the TOTAL row below it) doesn't sum to the DB's total row count.{RESET}")
+        print(f"  {DIM}\"FullTxt\" = content_body >= {FULL_TEXT_MIN_LEN} chars. "
+              f"\"Abstract\" = has content_body but shorter (pre-enrichment academic "
+              f"records) or empty-string permanent-failure sentinels.{RESET}")
+        print()
+
+    # ── Unprocessed queue by track (how much backlog is sitting waiting) ──
+    # Two stages, matching src/pipeline.py:
+    #   awaiting_oa_check  — has a DOI, Unpaywall hasn't been asked yet (or
+    #                        was asked and said OA but we still lack a URL)
+    #   awaiting_fulltext  — Unpaywall already gave us a real oa_url, but
+    #                        enrich_fulltext hasn't fetched/parsed it yet
+    cur.execute("""
+        SELECT
+            domain_value AS track,
+            COUNT(*) FILTER (
+                WHERE doi IS NOT NULL
+                  AND (open_access IS NULL
+                       OR (open_access = true AND oa_url IS NULL))
+            ) AS awaiting_oa_check,
+            COUNT(*) FILTER (
+                WHERE open_access = true AND content_body IS NULL
+                  AND doi IS NOT NULL AND oa_url IS NOT NULL
+            ) AS awaiting_fulltext
+        FROM crawled_items,
+             LATERAL jsonb_array_elements_text(
+                 COALESCE(domain_tags, '[]'::jsonb)
+             ) AS domain_value
+        WHERE authority_tier IN (1, 2)
+        GROUP BY domain_value
+        ORDER BY awaiting_fulltext DESC;
+    """)
+    queue_rows = cur.fetchall()
+
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    print(f"  {BOLD}{CYAN}Unprocessed queue by track (how bad is the backlog){RESET}")
+    print(f"  {BOLD}{'─'*70}{RESET}")
+
+    if not queue_rows:
+        print(f"  {WARN}No Tier 1/2 queue data found.{RESET}")
+    else:
+        print(f"  {BOLD}{'Track':<14} {'Awaiting OA-check':>18} {'Awaiting fulltext':>18}{RESET}")
+        print(f"  {'─'*14} {'─'*18} {'─'*18}")
+
+        sum_oa_wait = sum_ft_wait = 0
+        for track, oa_wait, ft_wait in queue_rows:
+            print(f"  {track:<14} {oa_wait:>18,} {ft_wait:>18,}")
+            sum_oa_wait += oa_wait
+            sum_ft_wait += ft_wait
+
+        print(f"  {'─'*14} {'─'*18} {'─'*18}")
+        print(f"  {BOLD}{'TOTAL':<14} {sum_oa_wait:>18,} {sum_ft_wait:>18,}{RESET}")
+        print()
+        print(f"  {DIM}\"Awaiting OA-check\" = has a DOI, hasn't been asked to Unpaywall yet "
+              f"(runs in batches of 300 every 30 min).{RESET}")
+        print(f"  {DIM}\"Awaiting fulltext\" = Unpaywall already gave us a real download URL, "
+              f"but the actual fetch+extract hasn't happened yet (runs in batches of 300 "
+              f"every 30 min). This does NOT mean these will become real articles — most "
+              f"turn out paywalled/bot-blocked (mdpi.com, wiley, sagepub, sciencedirect, "
+              f"tandfonline, etc. routinely 403 us) and get marked as confirmed dead ends "
+              f"instead. This number just means \"gets a final answer next,\" not \"will succeed.\"{RESET}")
+        print()
+
+    cur.close()
+    conn.close()
+
+except Exception as e:
+    import traceback
+    print(f"  {WARN}[WARN]{RESET}  DB query failed: {e}")
+    traceback.print_exc()
+
+# ── Last enrichment cycle (from crawler.log, not the DB) ──────────────────
+# enrich_fulltext_loop runs every 30 min and logs its own result EVERY time
+# now (including 0 — see src/pipeline.py), so the last matching line is
+# always the true most-recent cycle, never a stale nonzero one from
+# several cycles back.
+import re as _re
+try:
+    log_path = pathlib.Path("crawler.log")
+    with open(log_path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - 800_000))  # scheduler/collector logging in between
+        # the two enrichment lines can be verbose enough to push them apart by
+        # 300KB+ within a single ~30-min cycle — 800KB gives real headroom
+        tail = f.read().decode("utf-8", errors="replace")
+
+    oa_matches = _re.findall(
+        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) INFO:src\.pipeline:enrich_unpaywall: resolved (\d+) OA URLs",
+        tail, _re.MULTILINE,
+    )
+    ft_matches = _re.findall(
+        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) INFO:src\.pipeline:enrich_fulltext: enriched (\d+) records with full text",
+        tail, _re.MULTILINE,
+    )
+
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    print(f"  {BOLD}{CYAN}Last enrichment cycle (from crawler.log){RESET}")
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    if ft_matches:
+        ts, n = ft_matches[-1]
+        print(f"  Full articles downloaded (last ~30-min cycle): {GREEN}{int(n)}{RESET}  "
+              f"{DIM}(logged at {ts}, server-local time — not UTC){RESET}")
+    else:
+        print(f"  {WARN}No enrich_fulltext cycle found in the last ~300KB of crawler.log.{RESET}")
+    if oa_matches:
+        ts, n = oa_matches[-1]
+        print(f"  OA-status checks resolved (same cycle):        {int(n)}  "
+              f"{DIM}(logged at {ts}, server-local time — not UTC){RESET}")
+    print()
+except FileNotFoundError:
+    print(f"  {WARN}crawler.log not found — can't report the last enrichment cycle.{RESET}")
+except Exception as e:
+    print(f"  {WARN}[WARN]{RESET}  Reading crawler.log failed: {e}")
 PYEOF
 }
 
@@ -913,26 +1352,34 @@ check_status() {
     echo
     info "=== Service status ==="
     echo
+
+    # ── Crawler ──
+    # is_running() adopts an externally-started process if found via pgrep.
     if is_running; then
         local pid
         pid=$(cat "$PID_FILE")
-        success "Crawler is RUNNING  (PID $pid)"
-        echo
-        # Memory / CPU via ps
-        ps -p "$pid" -o pid,pcpu,pmem,etime,cmd --no-headers 2>/dev/null \
-            | awk '{printf "  PID: %s  CPU: %s%%  MEM: %s%%  Uptime: %s\n", $1,$2,$3,$4}' || true
+        local cmd
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null | head -1 || echo "n/a")
+        local started
+        started=$(ps -p "$pid" -o lstart= 2>/dev/null | xargs || echo "n/a")
+        success "Crawler     UP   │ PID $pid │ started: $started │ $cmd"
     else
-        warn "Crawler is NOT running."
+        warn    "Crawler     DOWN"
     fi
 
-    echo
-    info "=== Last 30 log lines ($LOG_FILE) ==="
-    echo
-    if [[ -f "$LOG_FILE" ]]; then
-        tail -30 "$LOG_FILE"
+    # ── Django admin ──
+    if is_admin_running; then
+        local apid
+        apid=$(cat "$ADMIN_PID_FILE")
+        local acmd
+        acmd=$(ps -p "$apid" -o command= 2>/dev/null | head -1 || echo "n/a")
+        local astarted
+        astarted=$(ps -p "$apid" -o lstart= 2>/dev/null | xargs || echo "n/a")
+        success "Django admin UP   │ PID $apid │ started: $astarted │ $acmd"
     else
-        warn "No log file found yet."
+        warn    "Django admin DOWN"
     fi
+
     echo
 }
 
@@ -951,9 +1398,11 @@ print_menu() {
     echo -e "  ${RED}6)${RESET} Stop all services     (crawler + Django admin)"
     echo -e "  ${CYAN}7)${RESET} Show DB stats         (size / crawled items / sources)"
     echo -e "  ${GREEN}8)${RESET} Install & initialize PostgreSQL"
+    echo -e "  ${CYAN}9)${RESET} Run test suite         (pytest tests/)"
+    echo -e "  ${CYAN}10)${RESET} Show full articles by track (sleep/eating/behavior/...)"
     echo -e "  ${RED}0)${RESET} Exit"
     echo
-    echo -n "  Select an option [0-8]: "
+    echo -n "  Select an option [0-10]: "
 }
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -972,6 +1421,8 @@ while true; do
         6) stop_all          ;;
         7) show_db_stats     ;;
         8) install_postgres  ;;
+        9) run_tests         ;;
+        10) show_track_stats ;;
         0)
             echo
             info "Goodbye."
@@ -979,7 +1430,7 @@ while true; do
             exit 0
             ;;
         *)
-            error "Invalid option '${choice}'. Please enter 0–8."
+            error "Invalid option '${choice}'. Please enter 0–10."
             ;;
     esac
 done

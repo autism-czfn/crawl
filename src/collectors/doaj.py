@@ -1,9 +1,17 @@
-"""DOAJ (Directory of Open Access Journals) REST API collector."""
+"""DOAJ (Directory of Open Access Journals) REST API collector.
+
+Full-text strategy:
+  DOAJ only indexes open-access articles.  When the record carries a
+  'fulltext' link, fetch it (HTML via trafilatura, or PDF if the link
+  points at one) and use it as content_body; falls back to the abstract.
+"""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from src.collectors.base import CollectedItem, normalize_doi
+from src.collectors.fulltext import fetch_html_and_extract, fetch_pdf_url
 from src.http.client import get_shared_client
 
 logger = logging.getLogger(__name__)
@@ -97,9 +105,29 @@ async def collect(
                 journal=journal_name,
                 open_access=True,
                 engagement={},
-                raw_payload=r,
+                raw_payload={**r, "_full_text_link": full_text_link},
             )
         )
+
+    # Fetch full text concurrently — DOAJ articles are all open access
+    client = get_shared_client()
+
+    async def _enrich(item: CollectedItem) -> CollectedItem:
+        link = item.get("raw_payload", {}).pop("_full_text_link", None)
+        if not link:
+            return item
+        if link.lower().endswith(".pdf"):
+            text = await fetch_pdf_url(client, link)
+        else:
+            text = await fetch_html_and_extract(client, link)
+        if text:
+            item["content_body"] = text
+        return item
+
+    items = list(await asyncio.gather(*[_enrich(item) for item in items]))
+
+    full_count = sum(1 for it in items if it.get("content_body"))
+    logger.info("DOAJ: %d articles, %d with full text", len(items), full_count)
 
     page_size = len(results)
     fetched = (page - 1) * min(limit, 100) + page_size

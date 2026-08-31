@@ -1,9 +1,12 @@
 """Scheduler: polls surfaces on their configured intervals and dispatches collectors."""
+from __future__ import annotations
+
 import asyncio
 import importlib
 import json
 import logging
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -37,6 +40,8 @@ _COLLECTOR_MAP: dict[str, str] = {
     "sitemap": "src.collectors.sitemap",
     "nhs_api": "src.collectors.nhs",
     "cdc_data": "src.collectors.cdc_data",
+    "link_harvester": "src.collectors.link_harvester",
+    "link_harvester_backfill": "src.collectors.link_harvester_backfill",
 }
 
 _SURFACES_JSON = Path(__file__).parent.parent / "config" / "surfaces.json"
@@ -47,7 +52,7 @@ _STALENESS_CHECK_INTERVAL = 3600   # check staleness once per hour
 # Playwright launches a full Chromium subprocess (~700 MB–1 GB RSS each).
 # Cap concurrent playwright_crawl runs to prevent OOM when many surfaces are due
 # simultaneously (e.g. first run after a config change, or after 24-hour poll fires).
-_PLAYWRIGHT_CONCURRENCY = 2
+_PLAYWRIGHT_CONCURRENCY = 1  # reduced from 2; each Chromium uses ~700 MB on 7.4 GB host
 _playwright_semaphore: asyncio.Semaphore | None = None
 
 
@@ -89,7 +94,7 @@ class Scheduler:
                     surface = Surface(
                         key=s["key"],
                         platform=s["platform"],
-                        enabled=s.get("enabled", True),
+                        enabled=bool(s.get("enabled", 1)),  # accepts 1/0 or true/false
                         poll_interval_sec=s.get("poll_interval_sec", 3600),
                         max_items_per_run=s.get("max_items", 30),
                         config_json=s.get("config", {}),
@@ -99,9 +104,38 @@ class Scheduler:
                         language=s.get("language", "en"),
                         country=s.get("country"),
                         organization_name=s.get("organization_name"),
+                        domain_tags=s.get("domain_tags"),
+                        topic_tags=s.get("topic_tags"),
                     )
                     session.add(surface)
                     logger.info("Seeded surface: %s", s["key"])
+                else:
+                    # Upsert config fields from surfaces.json.
+                    # Preserve runtime-only fields: last_run_at, last_cursor,
+                    # consecutive_fails, force_recrawl, overrides_json.
+                    file_config = s.get("config", {})
+                    # DB overrides_json wins over file config values
+                    effective_config = {**file_config, **(existing.overrides_json or {})}
+                    await session.execute(
+                        update(Surface)
+                        .where(Surface.key == s["key"])
+                        .values(
+                            platform=s["platform"],
+                            enabled=bool(s.get("enabled", existing.enabled)),  # accepts 1/0 or true/false
+                            poll_interval_sec=s.get("poll_interval_sec", existing.poll_interval_sec),
+                            max_items_per_run=s.get("max_items", existing.max_items_per_run),
+                            config_json=effective_config,
+                            authority_tier=s.get("authority_tier", existing.authority_tier),
+                            source_type=s.get("source_type", existing.source_type),
+                            audience_type=s.get("audience_type", existing.audience_type),
+                            language=s.get("language", existing.language),
+                            country=s.get("country", existing.country),
+                            organization_name=s.get("organization_name", existing.organization_name),
+                            domain_tags=s.get("domain_tags", existing.domain_tags),
+                            topic_tags=s.get("topic_tags", existing.topic_tags),
+                        )
+                    )
+                    logger.debug("Updated surface config: %s", s["key"])
             await session.commit()
 
     async def _tick(self) -> None:
@@ -178,7 +212,7 @@ class Scheduler:
 
             except Exception as exc:
                 await session.rollback()
-                logger.error("Surface %s failed: %s", surface_key, exc)
+                logger.error("Surface %s failed: %s\n%s", surface_key, exc, traceback.format_exc())
                 await session.execute(
                     update(Surface)
                     .where(Surface.key == surface_key)
@@ -247,3 +281,44 @@ def _is_due(surface: Surface, now: datetime) -> bool:
         last = last.replace(tzinfo=timezone.utc)
     elapsed = (now - last).total_seconds()
     return elapsed >= surface.poll_interval_sec
+
+
+# ---------------------------------------------------------------------------
+# P3-D: Crawl health metrics
+# ---------------------------------------------------------------------------
+
+async def log_health_metrics() -> None:
+    """Emit structured JSON health metrics every hour."""
+    import json
+    metrics_logger = logging.getLogger("crawl.metrics")
+    while True:
+        try:
+            from sqlalchemy import func
+            from sqlalchemy import select as _select
+            from src.storage.models import CrawledItem as _CrawledItem, Chunk as _Chunk, Surface as _Surface
+
+            async with AsyncSessionLocal() as session:
+                embedding_queue = await session.scalar(
+                    _select(func.count()).select_from(_CrawledItem)
+                    .where(_CrawledItem.embedding.is_(None))
+                    .where(_CrawledItem.content_body.isnot(None))
+                )
+                chunk_queue = await session.scalar(
+                    _select(func.count()).select_from(_CrawledItem)
+                    .where(_CrawledItem.content_body.isnot(None))
+                    .where(_CrawledItem.content_body != "")
+                )
+                fail_surfaces = await session.scalar(
+                    _select(func.count()).select_from(_Surface)
+                    .where(_Surface.consecutive_fails > 3)
+                )
+
+            metrics_logger.info(json.dumps({
+                "metric": "crawl_health",
+                "embedding_queue_depth": embedding_queue,
+                "chunk_queue_depth": chunk_queue,
+                "surfaces_failing": fail_surfaces,
+            }))
+        except Exception as exc:
+            metrics_logger.error("Health metrics error: %s", exc)
+        await asyncio.sleep(3600)

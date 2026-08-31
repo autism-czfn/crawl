@@ -1,6 +1,11 @@
-"""Generic RSS/Atom feed collector using feedparser."""
+"""Generic RSS/Atom feed collector using feedparser.
+
+Sprint P3-F: ETag/Last-Modified caching — avoids redundant fetches by
+storing and sending HTTP conditional request headers.
+"""
 from __future__ import annotations
 
+import hashlib
 import logging
 from email.utils import parsedate_to_datetime
 
@@ -10,6 +15,36 @@ from src.collectors.base import CollectedItem
 from src.http.client import get_shared_client
 
 logger = logging.getLogger(__name__)
+
+
+def _url_hash(url: str) -> str:
+    return hashlib.sha256(url.encode()).hexdigest()
+
+
+async def _get_cache(session, url: str):
+    """Return (etag, last_modified) from HttpCache, or (None, None)."""
+    from src.storage.models import HttpCache
+    row = await session.get(HttpCache, _url_hash(url))
+    if row:
+        return row.etag, row.last_modified
+    return None, None
+
+
+async def _set_cache(session, url: str, etag: str | None, last_modified: str | None) -> None:
+    """Upsert etag/last_modified for url into HttpCache."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from src.storage.models import HttpCache
+    stmt = pg_insert(HttpCache).values(
+        url_hash=_url_hash(url),
+        etag=etag,
+        last_modified=last_modified,
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["url_hash"],
+        set_={"etag": stmt.excluded.etag, "last_modified": stmt.excluded.last_modified},
+    )
+    await session.execute(stmt)
+    await session.commit()
 
 
 async def collect(
@@ -29,7 +64,33 @@ async def collect(
 
     for feed_url in feeds:
         try:
-            resp = await client.get(feed_url)
+            # P3-F: check HttpCache for stored ETag/Last-Modified
+            from src.storage.db import AsyncSessionLocal
+            etag: str | None = None
+            last_modified: str | None = None
+            async with AsyncSessionLocal() as cache_session:
+                etag, last_modified = await _get_cache(cache_session, feed_url)
+
+            headers: dict[str, str] = {}
+            if etag:
+                headers["If-None-Match"] = etag
+            if last_modified:
+                headers["If-Modified-Since"] = last_modified
+
+            resp = await client.get(feed_url, headers=headers if headers else None)
+
+            # 304 Not Modified — nothing new
+            if resp.status_code == 304:
+                logger.debug("RSS feed not modified (304): %s", feed_url)
+                continue
+
+            # Store new ETag / Last-Modified for next poll
+            new_etag = resp.headers.get("ETag") or resp.headers.get("etag")
+            new_lm = resp.headers.get("Last-Modified") or resp.headers.get("last-modified")
+            if new_etag or new_lm:
+                async with AsyncSessionLocal() as cache_session:
+                    await _set_cache(cache_session, feed_url, new_etag, new_lm)
+
             parsed = feedparser.parse(resp.text)
         except Exception as exc:
             logger.error("RSS fetch failed for %s: %s", feed_url, exc)
@@ -108,5 +169,29 @@ async def collect(
                 raw_payload=dict(entry),
             )
         )
+
+    # Secondary pass: fetch full article body for each item
+    from src.extractors.html import extract_body
+    fetched = skipped = 0
+    for item in items:
+        url = item.get("url", "")
+        if not url:
+            continue
+        try:
+            art_resp = await client.get(url, use_browser_ua=True)
+            from bs4 import BeautifulSoup
+            art_soup = BeautifulSoup(art_resp.text, "html.parser")
+            body = extract_body(art_soup)
+            if body:
+                item["content_body"] = body
+                fetched += 1
+            else:
+                skipped += 1
+                logger.warning("RSS body too short/boilerplate, skipped: %s", url)
+        except Exception as exc:
+            skipped += 1
+            logger.warning("RSS article body fetch failed for %s: %s", url, exc)
+    if fetched or skipped:
+        logger.info("RSS secondary fetch: %d bodies extracted, %d failed/skipped", fetched, skipped)
 
     return items, new_cursor or cursor

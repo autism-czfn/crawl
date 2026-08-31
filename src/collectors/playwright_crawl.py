@@ -33,46 +33,36 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 from src.collectors.base import CollectedItem
+from src.collectors.url_filter import is_content_url
+from src.extractors.html import extract_body as _extract_body
 
 logger = logging.getLogger(__name__)
 
-
-def _extract_body(soup: BeautifulSoup) -> str | None:
-    """Extract main article body text, stripping nav/footer/sidebar."""
-    # Work on a copy to avoid mutating the original
-    work = BeautifulSoup(str(soup), "html.parser")
-    for tag in work.find_all(["nav", "footer", "aside", "header", "script", "style", "noscript"]):
-        tag.decompose()
-
-    # Try common article body selectors in priority order
-    selectors = [
-        "article",
-        "[role='main']",
-        "main",
-        ".entry-content",
-        ".post-content",
-        ".article-body",
-        ".content-body",
-        "#content",
-        "#main-content",
-    ]
-    for sel in selectors:
-        el = work.select_one(sel)
-        if el:
-            text = el.get_text(" ", strip=True)
-            if len(text) > 100:  # meaningful content
-                return _clean_text(text)
-
-    # Fallback: get body text
-    body = work.find("body")
-    if body:
-        text = body.get_text(" ", strip=True)
-        if len(text) > 100:
-            return _clean_text(text)
-    return None
-
 # Maximum pages to visit per run (safety cap)
 _MAX_PAGES = 50
+
+# Page-title substrings indicating we did not get real content — either a
+# bot-protection challenge/block page, or a bare HTTP-error page rendered as
+# HTML. Found live while validating hopkinsmedicine.org: its Cloudflare
+# variant titles the block page "Attention Required! | Cloudflare", not
+# "Just a Moment..." (the only pattern this used to check for) — both must
+# be treated the same way: don't wait-and-retry past a straight block/error,
+# and don't fall through to storing the block page itself as a "real" item
+# via the last-resort <title> tag path.
+_NON_CONTENT_TITLE_MARKERS = (
+    "just a moment",
+    "attention required",
+    "403 forbidden",
+    "404 not found",
+    "access denied",
+)
+
+
+def _looks_like_non_content_title(title: str | None) -> bool:
+    if not title:
+        return False
+    lowered = title.lower()
+    return any(marker in lowered for marker in _NON_CONTENT_TITLE_MARKERS)
 
 # Per-site CSS selectors — same idea as html_crawl but for JS-rendered pages
 _SITE_SELECTORS: dict[str, dict[str, str]] = {
@@ -206,7 +196,11 @@ async def _fetch_page(
         # Extra wait for JS-rendered content / Cloudflare interstitial
         await page.wait_for_timeout(wait_ms)
 
-        # Check if we're still on a Cloudflare challenge page
+        # Check if we're on a challenge/block/error page rather than real
+        # content. Only "just a moment" is worth an extra wait (it's a JS
+        # challenge that can resolve); the others (a Cloudflare block screen,
+        # a bare 403/404) won't change no matter how long we wait, so give
+        # up immediately rather than burning 10s for nothing.
         title = await page.title()
         if "just a moment" in title.lower():
             logger.warning(
@@ -215,9 +209,12 @@ async def _fetch_page(
             )
             await page.wait_for_timeout(10_000)
             title = await page.title()
-            if "just a moment" in title.lower():
-                logger.error("playwright_crawl: could not pass Cloudflare challenge for %s", url)
-                return None
+
+        if _looks_like_non_content_title(title):
+            logger.error(
+                "playwright_crawl: got a block/error page (title=%r) for %s", title, url,
+            )
+            return None
 
         return await page.content()
 
@@ -265,21 +262,17 @@ def _extract_links(
         full_url = urljoin(base_url, href)
         parsed = urlparse(full_url)
 
-        if same_domain_only and parsed.netloc != base_domain:
-            continue
-
-        # Skip non-content paths
-        path = parsed.path.lower()
-        if any(x in path for x in ("/tag/", "/category/", "/author/", "/feed/", "/page/", "/login", "/register")):
+        # Enforce same-domain (when requested), blocked-segment, and
+        # minimum-depth rules via the shared content-URL filter.
+        # When same_domain_only is False we still reject non-content
+        # segments on the target domain itself.
+        check_domain = base_domain if same_domain_only else parsed.netloc
+        if not is_content_url(full_url, check_domain):
             continue
 
         if allowed_paths or excluded_paths:
             if not _matches_path_filter(full_url, allowed_paths or [], excluded_paths or []):
                 continue
-
-        # Must have a meaningful path
-        if len(parsed.path) <= 1:
-            continue
 
         # Normalize: strip fragments and trailing slashes for dedup
         clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"

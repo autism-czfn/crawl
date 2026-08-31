@@ -18,45 +18,14 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 from src.collectors.base import CollectedItem
+from src.collectors.url_filter import is_content_url
 from src.http.client import get_shared_client
 from src.http.human import HumanBehaviorSimulator
 
 logger = logging.getLogger(__name__)
 
 
-def _extract_body(soup: BeautifulSoup) -> str | None:
-    """Extract main article body text, stripping nav/footer/sidebar."""
-    # Work on a copy to avoid mutating the original
-    work = BeautifulSoup(str(soup), "html.parser")
-    for tag in work.find_all(["nav", "footer", "aside", "header", "script", "style", "noscript"]):
-        tag.decompose()
-
-    # Try common article body selectors in priority order
-    selectors = [
-        "article",
-        "[role='main']",
-        "main",
-        ".entry-content",
-        ".post-content",
-        ".article-body",
-        ".content-body",
-        "#content",
-        "#main-content",
-    ]
-    for sel in selectors:
-        el = work.select_one(sel)
-        if el:
-            text = el.get_text(" ", strip=True)
-            if len(text) > 100:  # meaningful content
-                return _clean_text(text)
-
-    # Fallback: get body text
-    body = work.find("body")
-    if body:
-        text = body.get_text(" ", strip=True)
-        if len(text) > 100:
-            return _clean_text(text)
-    return None
+from src.extractors.html import extract_body as _extract_body_shared
 
 # Per-site CSS selectors: title / body / author / date
 _SITE_SELECTORS: dict[str, dict[str, str]] = {
@@ -104,8 +73,8 @@ _SITE_SELECTORS: dict[str, dict[str, str]] = {
         "date": "",
     },
     "rehab.go.jp": {
-        "title": "h1",
-        "body": "article, div#primary.content-primary",
+        "title": "title",   # no h1; page title is in <title> tag
+        "body": "main",     # confirmed via manual inspection
         "author": "",
         "date": "",
     },
@@ -127,13 +96,26 @@ async def collect(
 ) -> tuple[list[CollectedItem], str | None]:
     """
     config keys:
-      base_url: str   — listing page URL to crawl for article links
+      base_url:            str        — listing page URL to crawl for article links
+      allowed_paths:       list[str]  — path glob patterns to allow
+      excluded_paths:      list[str]  — path glob patterns to exclude
+      max_crawl_depth:     int        — BFS depth (default 1; 1 = listing->articles only)
+      follow_child_links:  bool       — follow links found on article pages (default false)
+      child_link_domains:  list[str]  — extra trusted domains for cross-domain link detection
+      selectors:           dict       — per-surface CSS selectors override
+      min_path_segments:   int        — override minimum path depth filter (default 2)
     cursor: URL of last article processed (skip older) or None
     """
     base_url: str = config["base_url"]
     allowed_paths: list[str] = config.get("allowed_paths", [])
     excluded_paths: list[str] = config.get("excluded_paths", [])
-    max_crawl_depth: int = config.get("max_crawl_depth", 2)
+    max_crawl_depth: int = config.get("max_crawl_depth", 1)
+    follow_child_links: bool = config.get("follow_child_links", False)
+    child_link_domains: list[str] = config.get("child_link_domains", [])
+    surface_selectors: dict = config.get("selectors", {})
+    min_path_segments: int = config.get("min_path_segments", 2)
+    positive_url_patterns: list[str] = config.get("positive_url_patterns", [])
+    negative_url_patterns: list[str] = config.get("negative_url_patterns", [])
     client = get_shared_client()
     domain = urlparse(base_url).netloc.lstrip("www.")
 
@@ -158,8 +140,10 @@ async def collect(
         return [], cursor
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    logger.debug("html_crawl: max_crawl_depth=%d (single-level crawl, depth limited by max_items)", max_crawl_depth)
-    article_urls = _extract_article_links(soup, base_url, allowed_paths, excluded_paths)
+    article_urls = _extract_article_links(
+        soup, base_url, allowed_paths, excluded_paths, min_path_segments,
+        positive_url_patterns, negative_url_patterns, child_link_domains,
+    )
 
     if not article_urls:
         logger.warning("html_crawl: no article links found on %s", base_url)
@@ -170,11 +154,26 @@ async def collect(
         idx = article_urls.index(cursor)
         article_urls = article_urls[:idx]
 
+    # Pre-flight dedup: filter out URLs already in the DB
+    article_urls = await _filter_known_urls(article_urls)
+
     items: list[CollectedItem] = []
     new_cursor: str | None = article_urls[0] if article_urls else cursor
 
-    for url in article_urls[:limit]:
-        await asyncio.sleep(0.5)  # Strategy 9: between-request delay
+    # BFS frontier: (url, depth)
+    from collections import deque
+    frontier: deque[tuple[str, int]] = deque(
+        (url, 1) for url in article_urls[:limit]
+    )
+    visited: set[str] = set()
+
+    while frontier and len(items) < limit:
+        url, depth = frontier.popleft()
+        if url in visited:
+            continue
+        visited.add(url)
+
+        await asyncio.sleep(0.5)
         await _simulator.pre_request_delay()
 
         try:
@@ -186,16 +185,26 @@ async def collect(
             _simulator.record_real_request()
         except PermissionError as exc:
             _simulator.on_blocked()
-            logger.warning("html_crawl article blocked: %s", exc)
+            logger.warning("html_crawl article blocked at depth %d: %s", depth, exc)
             continue
         except Exception as exc:
             logger.warning("html_crawl article fetch failed %s: %s", url, exc)
             continue
 
         art_soup = BeautifulSoup(art_resp.text, "html.parser")
-        item = _extract_article(art_soup, url, domain, base_url)
+        item = _extract_article(art_soup, url, domain, base_url, surface_selectors)
         if item:
             items.append(item)
+
+        # BFS: enqueue child links if depth allows
+        if depth < max_crawl_depth or follow_child_links:
+            child_links = _extract_article_links(
+                art_soup, url, allowed_paths, excluded_paths, min_path_segments
+            )
+            next_depth = depth + 1
+            for child in child_links:
+                if child not in visited and len(items) + len(frontier) < limit * 2:
+                    frontier.append((child, next_depth))
 
     return items, new_cursor
 
@@ -217,29 +226,82 @@ def _matches_path_filter(url: str, allowed_paths: list[str], excluded_paths: lis
     return True  # No filters = allow all
 
 
-def _extract_article_links(soup: BeautifulSoup, base_url: str, allowed_paths: list[str] = None, excluded_paths: list[str] = None) -> list[str]:
+async def _filter_known_urls(urls: list[str]) -> list[str]:
+    """Filter out URLs already present in the DB. Returns only unvisited URLs."""
+    if not urls:
+        return urls
+    from src.storage.db import AsyncSessionLocal
+    from src.storage.models import CrawledItem
+    from sqlalchemy import select
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(CrawledItem.url).where(CrawledItem.url.in_(urls))
+        )
+        known = {row[0] for row in result.fetchall()}
+    filtered = [u for u in urls if u not in known]
+    logger.debug("html_crawl pre-flight dedup: %d urls -> %d new", len(urls), len(filtered))
+    return filtered
+
+
+def _url_score(url: str, positive_patterns: list[str], negative_patterns: list[str]) -> int:
+    """Score a URL for article likelihood. Returns score; follow only if >= 0 (default)
+    or >= 2 when patterns are active (per review heuristic)."""
+    score = 0
+    for p in positive_patterns:
+        if p in url:
+            score += 5
+    for p in negative_patterns:
+        if p in url:
+            score -= 8
+    # Penalise very deep paths (6+ slashes) — usually pagination or params
+    if url.count("/") > 6:
+        score -= 2
+    return score
+
+
+def _extract_article_links(
+    soup: BeautifulSoup,
+    base_url: str,
+    allowed_paths: list[str] | None = None,
+    excluded_paths: list[str] | None = None,
+    min_path_segments: int = 2,
+    positive_url_patterns: list[str] | None = None,
+    negative_url_patterns: list[str] | None = None,
+    child_link_domains: list[str] | None = None,
+) -> list[str]:
     """Find article links on a listing page."""
     base_domain = urlparse(base_url).netloc
+    use_scoring = bool(positive_url_patterns or negative_url_patterns)
 
-    # Look for common article link patterns
     candidates: list[str] = []
 
     for a in soup.find_all("a", href=True):
         href: str = a["href"]
         full_url = urljoin(base_url, href)
-        parsed = urlparse(full_url)
 
-        # Only same-domain links with meaningful paths
-        if parsed.netloc == base_domain and len(parsed.path) > 1:
-            # Exclude obvious non-article paths
-            path = parsed.path.lower()
-            if any(x in path for x in ("/tag/", "/category/", "/author/", "/feed/", "/page/", "#")):
+        # Enforce same-domain, blocked-segment, and minimum-depth rules.
+        if not is_content_url(full_url, base_domain, min_path_segments=min_path_segments, child_link_domains=child_link_domains):
+            continue
+
+        if allowed_paths or excluded_paths:
+            if not _matches_path_filter(full_url, allowed_paths or [], excluded_paths or []):
                 continue
-            if allowed_paths or excluded_paths:
-                if not _matches_path_filter(full_url, allowed_paths or [], excluded_paths or []):
-                    continue
-            if full_url not in candidates:
-                candidates.append(full_url)
+
+        # URL scoring: skip URLs that score below threshold when patterns active.
+        # Threshold is 2 when positive patterns are set (URL must earn its way in);
+        # 0 when only negative patterns are set (just block known bad paths).
+        if use_scoring:
+            score = _url_score(
+                full_url,
+                positive_url_patterns or [],
+                negative_url_patterns or [],
+            )
+            threshold = 2 if positive_url_patterns else 0
+            if score < threshold:
+                continue
+
+        if full_url not in candidates:
+            candidates.append(full_url)
 
     return candidates
 
@@ -249,21 +311,30 @@ def _extract_article(
     url: str,
     domain: str,
     base_url: str,
+    surface_selectors: dict | None = None,
 ) -> CollectedItem | None:
     """Extract article metadata using Strategy C priority order."""
 
+    # Per-site "body" selectors (curated for non-English/JS-light templates
+    # where Trafilatura's generic heuristics tend to miss) are handed to the
+    # shared body extractor as an extra fallback, regardless of which
+    # strategy below ends up supplying the title/description.
+    site_selectors = surface_selectors or _SITE_SELECTORS.get(domain) or {}
+    body_css = site_selectors.get("body", "")
+    custom_body_selectors = [s.strip() for s in body_css.split(",") if s.strip()] or None
+
     # 1. Try JSON-LD
-    item = _from_jsonld(soup, url, domain)
+    item = _from_jsonld(soup, url, domain, custom_body_selectors)
     if item:
         return item
 
     # 2. Try Open Graph
-    item = _from_opengraph(soup, url, domain)
+    item = _from_opengraph(soup, url, domain, custom_body_selectors)
     if item:
         return item
 
     # 3. Try per-site CSS selectors
-    item = _from_css_selectors(soup, url, domain)
+    item = _from_css_selectors(soup, url, domain, surface_selectors, custom_body_selectors)
     if item:
         return item
 
@@ -271,7 +342,7 @@ def _extract_article(
     return None
 
 
-def _from_jsonld(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem | None:
+def _from_jsonld(soup: BeautifulSoup, url: str, domain: str, custom_body_selectors: list[str] | None = None) -> CollectedItem | None:
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
@@ -300,7 +371,7 @@ def _from_jsonld(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem | 
                 source="html_crawl",
                 external_id=None,
                 description=_clean_text(description),
-                content_body=_extract_body(soup),
+                content_body=_extract_body_shared(soup, custom_selectors=custom_body_selectors),
                 author=author,
                 authors_json=None,
                 published_at=published_at,
@@ -316,7 +387,7 @@ def _from_jsonld(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem | 
     return None
 
 
-def _from_opengraph(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem | None:
+def _from_opengraph(soup: BeautifulSoup, url: str, domain: str, custom_body_selectors: list[str] | None = None) -> CollectedItem | None:
     def og(prop: str) -> str | None:
         tag = soup.find("meta", property=f"og:{prop}")
         return tag["content"].strip() if tag and tag.get("content") else None
@@ -339,7 +410,7 @@ def _from_opengraph(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem
         source="html_crawl",
         external_id=None,
         description=_clean_text(description),
-        content_body=_extract_body(soup),
+        content_body=_extract_body_shared(soup, custom_selectors=custom_body_selectors),
         author=author,
         authors_json=None,
         published_at=published_at,
@@ -352,8 +423,14 @@ def _from_opengraph(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem
     )
 
 
-def _from_css_selectors(soup: BeautifulSoup, url: str, domain: str) -> CollectedItem | None:
-    selectors = _SITE_SELECTORS.get(domain)
+def _from_css_selectors(
+    soup: BeautifulSoup,
+    url: str,
+    domain: str,
+    surface_selectors: dict | None = None,
+    custom_body_selectors: list[str] | None = None,
+) -> CollectedItem | None:
+    selectors = surface_selectors or _SITE_SELECTORS.get(domain)
     if not selectors:
         return None
 
@@ -377,7 +454,7 @@ def _from_css_selectors(soup: BeautifulSoup, url: str, domain: str) -> Collected
         source="html_crawl",
         external_id=None,
         description=_clean_text(sel(selectors.get("body", ""))),
-        content_body=_extract_body(soup),
+        content_body=_extract_body_shared(soup, custom_selectors=custom_body_selectors),
         author=sel(selectors.get("author", "")),
         authors_json=None,
         published_at=sel(selectors.get("date", "")),
