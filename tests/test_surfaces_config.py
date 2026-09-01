@@ -7,16 +7,16 @@ from pathlib import Path
 
 import pytest
 
+from src.discovery.constants import VALID_AUDIENCE_TYPES, VALID_DOMAIN_TAGS, VALID_SOURCE_TYPES
 from src.scheduler import _COLLECTOR_MAP
 
 SURFACES_PATH = Path(__file__).parent.parent / "config" / "surfaces.json"
 
-_VALID_SOURCE_TYPES = {
-    "official_health", "academic", "hospital", "nonprofit", "community",
-    "news", "social",
-}
-_VALID_AUDIENCE_TYPES = {"parent_facing", "clinician_facing", "mixed", "research"}
-_VALID_DOMAIN_TAGS = {"sleep", "eating", "behavioral", "adhd", "autism"}
+# Local aliases — kept so the rest of this file (written before the move
+# to src/discovery/constants.py) doesn't need every reference renamed.
+_VALID_SOURCE_TYPES = VALID_SOURCE_TYPES
+_VALID_AUDIENCE_TYPES = VALID_AUDIENCE_TYPES
+_VALID_DOMAIN_TAGS = VALID_DOMAIN_TAGS
 _NEW_DOMAINS = {"sleep", "eating", "adhd"}
 
 

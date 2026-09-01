@@ -3,6 +3,8 @@ import logging
 import signal
 from src.config import settings
 from src.chunk_pipeline import run_loop as chunk_loop
+from src.discovery.loop import discovery_loop
+from src.discovery.search_queue_loop import search_queue_loop
 from src.embeddings import subprocess_embedding_loop as embedding_loop
 from src.pipeline import enrich_fulltext_loop, shutdown_pdf_pool
 from src.scheduler import Scheduler, log_health_metrics
@@ -41,6 +43,8 @@ async def main() -> None:
         asyncio.create_task(chunk_loop()),
         asyncio.create_task(enrich_fulltext_loop()),
         asyncio.create_task(log_health_metrics()),
+        asyncio.create_task(discovery_loop()),
+        asyncio.create_task(search_queue_loop()),
     ]
 
     await stop_event.wait()

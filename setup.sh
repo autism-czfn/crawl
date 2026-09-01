@@ -673,6 +673,58 @@ try:
               f"records) or empty-string permanent-failure sentinels.{RESET}")
         print()
 
+    # ── Source breakdown by track: crawl vs claude -p WebSearch discovery ──
+    # crawled_items.source is 'claude_websearch' for rows landed by
+    # src/discovery/loop.py (crawl.txt section 13's "第4层" WebSearch
+    # supplement) and the collector's own platform name (html_crawl,
+    # sitemap, pubmed, ...) for everything else. Same FULL_TEXT_MIN_LEN
+    # threshold and per-track unnesting as the table above.
+    cur.execute(f"""
+        SELECT
+            domain_value AS track,
+            COUNT(*) FILTER (WHERE source = 'claude_websearch') AS websearch_total,
+            COUNT(*) FILTER (WHERE source = 'claude_websearch'
+                              AND LENGTH(content_body) >= {FULL_TEXT_MIN_LEN}) AS websearch_full,
+            COUNT(*) FILTER (WHERE source != 'claude_websearch') AS crawl_total,
+            COUNT(*) FILTER (WHERE source != 'claude_websearch'
+                              AND LENGTH(content_body) >= {FULL_TEXT_MIN_LEN}) AS crawl_full
+        FROM crawled_items,
+             LATERAL jsonb_array_elements_text(
+                 COALESCE(domain_tags, '[]'::jsonb)
+             ) AS domain_value
+        WHERE authority_tier IN (1, 2)
+        GROUP BY domain_value
+        ORDER BY websearch_total DESC, track;
+    """)
+    source_rows = cur.fetchall()
+
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    print(f"  {BOLD}{CYAN}Source breakdown by track — crawl vs claude -p WebSearch{RESET}")
+    print(f"  {BOLD}{'─'*70}{RESET}")
+
+    if not source_rows:
+        print(f"  {WARN}No Tier 1/2 items with a domain_tags value found.{RESET}")
+    else:
+        print(f"  {BOLD}{'Track':<14} {'WebSearch':>9} {'WS FullTxt':>10} {'Crawl':>8} {'Crawl FullTxt':>13}{RESET}")
+        print(f"  {'─'*14} {'─'*9} {'─'*10} {'─'*8} {'─'*13}")
+
+        sum_ws_total = sum_ws_full = sum_crawl_total = sum_crawl_full = 0
+        for track, ws_total, ws_full, crawl_total, crawl_full in source_rows:
+            print(f"  {track:<14} {ws_total:>9,} {ws_full:>10,} {crawl_total:>8,} {crawl_full:>13,}")
+            sum_ws_total    += ws_total
+            sum_ws_full     += ws_full
+            sum_crawl_total += crawl_total
+            sum_crawl_full  += crawl_full
+
+        print(f"  {'─'*14} {'─'*9} {'─'*10} {'─'*8} {'─'*13}")
+        print(f"  {BOLD}{'TOTAL':<14} {sum_ws_total:>9,} {sum_ws_full:>10,} {sum_crawl_total:>8,} {sum_crawl_full:>13,}{RESET}")
+        print()
+        print(f"  {DIM}\"WebSearch\" = source='claude_websearch' (src/discovery/loop.py — the "
+              f"claude -p WebSearch discovery layer, crawl.txt section 13). \"Crawl\" = "
+              f"everything else (official APIs, sitemap/RSS, html_crawl/playwright_crawl). "
+              f"Same per-track double-counting caveat as the table above applies.{RESET}")
+        print()
+
     # ── Unprocessed queue by track (how much backlog is sitting waiting) ──
     # Two stages, matching src/pipeline.py:
     #   awaiting_oa_check  — has a DOI, Unpaywall hasn't been asked yet (or
@@ -728,6 +780,101 @@ try:
               f"turn out paywalled/bot-blocked (mdpi.com, wiley, sagepub, sciencedirect, "
               f"tandfonline, etc. routinely 403 us) and get marked as confirmed dead ends "
               f"instead. This number just means \"gets a final answer next,\" not \"will succeed.\"{RESET}")
+        print()
+
+    # ── WebSearch discovery queue (search repo's live-query fallback) ─────
+    # search_discovery_requests — search repo writes rows here directly via
+    # its own asyncpg pool (no HTTP API, same Postgres instance — see
+    # migration 0023 and src/discovery/search_queue_loop.py's docstring).
+    # status: pending/processing = not yet processed by crawl's
+    # search_queue_loop (processing = claimed mid-batch, or briefly stuck
+    # and about to be recovered); done/out_of_scope/failed = processed
+    # (a "failed" row with next_retry_at set will still be retried later —
+    # it counts as processed for *this* pass, not permanently resolved).
+    LIST_LIMIT = 20
+
+    cur.execute("SELECT status, COUNT(*) FROM search_discovery_requests GROUP BY status;")
+    status_counts = dict(cur.fetchall())
+
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    print(f"  {BOLD}{CYAN}WebSearch discovery queue (search repo → search_discovery_requests){RESET}")
+    print(f"  {BOLD}{'─'*70}{RESET}")
+
+    if not status_counts:
+        print(f"  {WARN}No rows in search_discovery_requests — search hasn't written anything "
+              f"there yet (this is not a crawl-side processing gap).{RESET}")
+        print()
+    else:
+        not_processed_total = status_counts.get("pending", 0) + status_counts.get("processing", 0)
+        processed_total = (status_counts.get("done", 0) + status_counts.get("out_of_scope", 0)
+                            + status_counts.get("failed", 0))
+
+        print(f"  Not processed: {WARN}{not_processed_total:,}{RESET}  "
+              f"(pending={status_counts.get('pending', 0):,}, "
+              f"processing={status_counts.get('processing', 0):,})")
+        print(f"  Processed:     {GREEN}{processed_total:,}{RESET}  "
+              f"(done={status_counts.get('done', 0):,}, "
+              f"out_of_scope={status_counts.get('out_of_scope', 0):,}, "
+              f"failed={status_counts.get('failed', 0):,})")
+        print()
+
+        cur.execute(f"""
+            SELECT id, url, status, discovered_at, retry_count, next_retry_at
+            FROM search_discovery_requests
+            WHERE status IN ('pending', 'processing')
+            ORDER BY discovered_at ASC
+            LIMIT {LIST_LIMIT};
+        """)
+        pending_rows = cur.fetchall()
+
+        print(f"  {BOLD}Not-processed entries{RESET} (oldest first, "
+              f"showing up to {LIST_LIMIT} of {not_processed_total:,}):")
+        if not pending_rows:
+            print(f"    {DIM}(none){RESET}")
+        else:
+            for rid, url, status, discovered_at, retry_count, next_retry_at in pending_rows:
+                extra = f" retry={retry_count}" if retry_count else ""
+                if next_retry_at:
+                    extra += f" next_retry={next_retry_at:%Y-%m-%d %H:%M}"
+                print(f"    #{rid:<6} [{status:<10}] {discovered_at:%Y-%m-%d %H:%M}  {url}{extra}")
+        print()
+
+        cur.execute(f"""
+            SELECT id, url, status, processed_at, error_note, retry_count,
+                   classifier_tier, classifier_reason, promoted_surface_key
+            FROM search_discovery_requests
+            WHERE status IN ('done', 'out_of_scope', 'failed')
+            ORDER BY processed_at DESC
+            LIMIT {LIST_LIMIT};
+        """)
+        processed_rows = cur.fetchall()
+
+        print(f"  {BOLD}Processed entries{RESET} (most recently processed first, "
+              f"showing up to {LIST_LIMIT} of {processed_total:,}):")
+        if not processed_rows:
+            print(f"    {DIM}(none){RESET}")
+        else:
+            for (rid, url, status, processed_at, error_note, retry_count,
+                 classifier_tier, classifier_reason, promoted_surface_key) in processed_rows:
+                ts = f"{processed_at:%Y-%m-%d %H:%M}" if processed_at else "?"
+                note = f"  ({error_note})" if error_note else ""
+                print(f"    #{rid:<6} [{status:<12}] {ts}  {url}{note}")
+                # Auto-classifier trail (websearch.txt 十九, made automatic —
+                # src/discovery/classifier.py + surfaces_writer.py): shown as
+                # a second indented line so a promoted/rejected domain is
+                # visible at a glance without cluttering the main line above.
+                if promoted_surface_key:
+                    print(f"      {GREEN}→ promoted as {promoted_surface_key}{RESET} "
+                          f"(tier{classifier_tier}, {classifier_reason!r})")
+                elif classifier_reason:
+                    print(f"      {DIM}classifier: tier={classifier_tier} — {classifier_reason!r}{RESET}")
+        print()
+        print(f"  {DIM}\"failed\" rows with a retry policy (websearch.txt 15.2) get picked up "
+              f"again at next_retry_at — see the not-processed list once that time arrives. "
+              f"\"out_of_scope\" = domain wasn't already a recognized tier1/2 surface; the Haiku "
+              f"classifier (src/discovery/classifier.py) then either promoted it into "
+              f"config/surfaces.json (shown as \"→ promoted as ...\" above) or rejected it "
+              f"(shown as \"classifier: ...\") — websearch.txt 十九.{RESET}")
         print()
 
     cur.close()
@@ -1399,7 +1546,7 @@ print_menu() {
     echo -e "  ${CYAN}7)${RESET} Show DB stats         (size / crawled items / sources)"
     echo -e "  ${GREEN}8)${RESET} Install & initialize PostgreSQL"
     echo -e "  ${CYAN}9)${RESET} Run test suite         (pytest tests/)"
-    echo -e "  ${CYAN}10)${RESET} Show full articles by track (sleep/eating/behavior/...)"
+    echo -e "  ${CYAN}10)${RESET} Show full articles by track + WebSearch discovery queue status"
     echo -e "  ${RED}0)${RESET} Exit"
     echo
     echo -n "  Select an option [0-10]: "

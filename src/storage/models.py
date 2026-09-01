@@ -1,6 +1,6 @@
 from datetime import datetime
 from sqlalchemy import (
-    Boolean, Column, DateTime, Integer, Text, UniqueConstraint, Index
+    BigInteger, Boolean, Column, DateTime, Integer, Text, UniqueConstraint, Index
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase
@@ -157,3 +157,62 @@ class BlockedDomain(Base):
     given_up = Column(Boolean, nullable=False, default=False)
     given_up_at = Column(DateTime(timezone=True), nullable=True)
     last_checked_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+
+
+class DiscoveryQueueState(Base):
+    """Durable round-robin cursor for discovery_loop() — see migration
+    0022_add_discovery_queue_state for the rationale. Singleton row
+    (id=1): one discovery_loop, one cursor."""
+    __tablename__ = "discovery_queue_state"
+
+    id = Column(Integer, primary_key=True)
+    last_index = Column(Integer, nullable=False, default=-1)
+    last_pair_domain = Column(Text, nullable=True)
+    last_pair_topic = Column(Text, nullable=True)
+    last_run_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class SearchDiscoveryRequest(Base):
+    """Shared DB-as-event-broker table between search repo and crawl —
+    see migration 0023_search_discovery_requests and websearch.txt
+    sections 十/十五/十九. search repo writes rows directly via its own
+    asyncpg pool (no HTTP API); search_queue_loop.py polls and processes
+    them here.
+
+    Column contract: url/title/snippet/source_domain/trigger_query are
+    what search writes — renaming/retyping those needs coordinating with
+    search. retry_count/last_http_status/next_retry_at/error_note/
+    processed_at/classifier_tier/classifier_confidence/classifier_reason/
+    promoted_surface_key are crawl-internal (search_queue_loop.py only);
+    crawl can change these freely.
+
+    classifier_tier/classifier_confidence/classifier_reason/
+    promoted_surface_key (migration 0024) record the
+    src/discovery/classifier.py verdict for a row whose domain wasn't
+    already tier1/2 — set regardless of whether that verdict led to a
+    promotion, so an out_of_scope row's reason is visible in the
+    setup.sh option-10 report instead of being silent (websearch.txt
+    section 十九). promoted_surface_key is the config/surfaces.json key
+    the domain was written under (src/discovery/surfaces_writer.py), null
+    if it was never promoted (rejected, or a classifier call that never
+    ran because the daily cap was already hit).
+    """
+    __tablename__ = "search_discovery_requests"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    url = Column(Text, nullable=False, unique=True)
+    title = Column(Text, nullable=True)
+    snippet = Column(Text, nullable=True)
+    source_domain = Column(Text, nullable=True)
+    trigger_query = Column(Text, nullable=True)
+    discovered_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    status = Column(Text, nullable=False, default="pending")
+    processed_at = Column(DateTime(timezone=True), nullable=True)
+    retry_count = Column(Integer, nullable=False, default=0)
+    last_http_status = Column(Integer, nullable=True)
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
+    error_note = Column(Text, nullable=True)
+    classifier_tier = Column(Integer, nullable=True)
+    classifier_confidence = Column(Text, nullable=True)
+    classifier_reason = Column(Text, nullable=True)
+    promoted_surface_key = Column(Text, nullable=True)
