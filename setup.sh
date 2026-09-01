@@ -818,57 +818,62 @@ try:
               f"failed={status_counts.get('failed', 0):,})")
         print()
 
-        cur.execute(f"""
-            SELECT id, url, status, discovered_at, retry_count, next_retry_at
-            FROM search_discovery_requests
-            WHERE status IN ('pending', 'processing')
-            ORDER BY discovered_at ASC
-            LIMIT {LIST_LIMIT};
-        """)
-        pending_rows = cur.fetchall()
+        # Detailed per-URL listing (not-processed + processed rows) disabled
+        # for now — the summary counts above are good enough day-to-day.
+        # Uncomment this block to see individual queue entries again.
+        #
+        # cur.execute(f"""
+        #     SELECT id, url, status, discovered_at, retry_count, next_retry_at
+        #     FROM search_discovery_requests
+        #     WHERE status IN ('pending', 'processing')
+        #     ORDER BY discovered_at ASC
+        #     LIMIT {LIST_LIMIT};
+        # """)
+        # pending_rows = cur.fetchall()
+        #
+        # print(f"  {BOLD}Not-processed entries{RESET} (oldest first, "
+        #       f"showing up to {LIST_LIMIT} of {not_processed_total:,}):")
+        # if not pending_rows:
+        #     print(f"    {DIM}(none){RESET}")
+        # else:
+        #     for rid, url, status, discovered_at, retry_count, next_retry_at in pending_rows:
+        #         extra = f" retry={retry_count}" if retry_count else ""
+        #         if next_retry_at:
+        #             extra += f" next_retry={next_retry_at:%Y-%m-%d %H:%M}"
+        #         print(f"    #{rid:<6} [{status:<10}] {discovered_at:%Y-%m-%d %H:%M}  {url}{extra}")
+        # print()
+        #
+        # cur.execute(f"""
+        #     SELECT id, url, status, processed_at, error_note, retry_count,
+        #            classifier_tier, classifier_reason, promoted_surface_key
+        #     FROM search_discovery_requests
+        #     WHERE status IN ('done', 'out_of_scope', 'failed')
+        #     ORDER BY processed_at DESC
+        #     LIMIT {LIST_LIMIT};
+        # """)
+        # processed_rows = cur.fetchall()
+        #
+        # print(f"  {BOLD}Processed entries{RESET} (most recently processed first, "
+        #       f"showing up to {LIST_LIMIT} of {processed_total:,}):")
+        # if not processed_rows:
+        #     print(f"    {DIM}(none){RESET}")
+        # else:
+        #     for (rid, url, status, processed_at, error_note, retry_count,
+        #          classifier_tier, classifier_reason, promoted_surface_key) in processed_rows:
+        #         ts = f"{processed_at:%Y-%m-%d %H:%M}" if processed_at else "?"
+        #         note = f"  ({error_note})" if error_note else ""
+        #         print(f"    #{rid:<6} [{status:<12}] {ts}  {url}{note}")
+        #         # Auto-classifier trail (websearch.txt 十九, made automatic —
+        #         # src/discovery/classifier.py + surfaces_writer.py): shown as
+        #         # a second indented line so a promoted/rejected domain is
+        #         # visible at a glance without cluttering the main line above.
+        #         if promoted_surface_key:
+        #             print(f"      {GREEN}→ promoted as {promoted_surface_key}{RESET} "
+        #                   f"(tier{classifier_tier}, {classifier_reason!r})")
+        #         elif classifier_reason:
+        #             print(f"      {DIM}classifier: tier={classifier_tier} — {classifier_reason!r}{RESET}")
+        # print()
 
-        print(f"  {BOLD}Not-processed entries{RESET} (oldest first, "
-              f"showing up to {LIST_LIMIT} of {not_processed_total:,}):")
-        if not pending_rows:
-            print(f"    {DIM}(none){RESET}")
-        else:
-            for rid, url, status, discovered_at, retry_count, next_retry_at in pending_rows:
-                extra = f" retry={retry_count}" if retry_count else ""
-                if next_retry_at:
-                    extra += f" next_retry={next_retry_at:%Y-%m-%d %H:%M}"
-                print(f"    #{rid:<6} [{status:<10}] {discovered_at:%Y-%m-%d %H:%M}  {url}{extra}")
-        print()
-
-        cur.execute(f"""
-            SELECT id, url, status, processed_at, error_note, retry_count,
-                   classifier_tier, classifier_reason, promoted_surface_key
-            FROM search_discovery_requests
-            WHERE status IN ('done', 'out_of_scope', 'failed')
-            ORDER BY processed_at DESC
-            LIMIT {LIST_LIMIT};
-        """)
-        processed_rows = cur.fetchall()
-
-        print(f"  {BOLD}Processed entries{RESET} (most recently processed first, "
-              f"showing up to {LIST_LIMIT} of {processed_total:,}):")
-        if not processed_rows:
-            print(f"    {DIM}(none){RESET}")
-        else:
-            for (rid, url, status, processed_at, error_note, retry_count,
-                 classifier_tier, classifier_reason, promoted_surface_key) in processed_rows:
-                ts = f"{processed_at:%Y-%m-%d %H:%M}" if processed_at else "?"
-                note = f"  ({error_note})" if error_note else ""
-                print(f"    #{rid:<6} [{status:<12}] {ts}  {url}{note}")
-                # Auto-classifier trail (websearch.txt 十九, made automatic —
-                # src/discovery/classifier.py + surfaces_writer.py): shown as
-                # a second indented line so a promoted/rejected domain is
-                # visible at a glance without cluttering the main line above.
-                if promoted_surface_key:
-                    print(f"      {GREEN}→ promoted as {promoted_surface_key}{RESET} "
-                          f"(tier{classifier_tier}, {classifier_reason!r})")
-                elif classifier_reason:
-                    print(f"      {DIM}classifier: tier={classifier_tier} — {classifier_reason!r}{RESET}")
-        print()
         print(f"  {DIM}\"failed\" rows with a retry policy (websearch.txt 15.2) get picked up "
               f"again at next_retry_at — see the not-processed list once that time arrives. "
               f"\"out_of_scope\" = domain wasn't already a recognized tier1/2 surface; the Haiku "
