@@ -1157,6 +1157,119 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 500) -> int:
     return enriched
 
 
+# Academic-API sources whose collectors DON'T fetch content_body at
+# collection time (see enrich_fulltext's docstring) — a record from one of
+# these with no DOI has NO other path to full text: enrich_unpaywall and
+# enrich_fulltext both hard-require doi IS NOT NULL, so it's permanently
+# invisible to the DOI pipeline even though the collector already gave us
+# a real, directly-fetchable url. Deliberately excludes youtube (already
+# attempts a transcript fetch synchronously at collection — a generic
+# HTML fetch of a video watch page gets nothing useful) and html_crawl
+# (also fetches synchronously; a NULL content_body there means extraction
+# already failed once with the same logic this would just repeat).
+_NO_DOI_ACADEMIC_SOURCES = (
+    "openalex", "core", "europepmc", "doaj",
+    "semanticscholar", "pubmed", "clinicaltrials",
+)
+
+
+async def enrich_no_doi_urls(session: AsyncSession, batch_size: int = 300) -> int:
+    """Fetch content directly, by URL, for academic-API records that have
+    NO DOI at all.
+
+    Confirmed live (2026-09-12): 1,411 Tier 1/2 records across
+    _NO_DOI_ACADEMIC_SOURCES sit permanently stuck with zero content for
+    exactly this reason — real papers about ADHD/autism/eating disorders/
+    sleep (e.g. a direct core.ac.uk PDF link, a EuropePMC article page), not
+    junk. This tries the url directly instead: PDF extraction for a `.pdf`
+    link, generic HTML+trafilatura otherwise — same fetch_pdf_url /
+    fetch_html_and_extract helpers the collectors themselves use for their
+    own fallback full-text attempts (src/collectors/fulltext.py).
+
+    Same per-URL give-up rule as enrich_fulltext's stage 3
+    (_URL_GIVE_UP_AFTER_ATTEMPTS): a dead/unfetchable URL is retried up to
+    3 times, then permanently marked with the '' sentinel, so it stops
+    occupying a batch slot forever.
+    """
+    import asyncio
+    from src.collectors.fulltext import fetch_html_and_extract, fetch_pdf_url
+    from src.http.client import get_shared_client
+
+    client = get_shared_client()
+    updated = 0
+
+    _priority = case(
+        (cast(CrawledItem.domain_tags, String).ilike("%sleep%"), 0),
+        (cast(CrawledItem.domain_tags, String).ilike("%eating%"), 0),
+        else_=1,
+    )
+    result = await session.execute(
+        select(CrawledItem.id, CrawledItem.url, CrawledItem.fetch_attempts)
+        .where(CrawledItem.doi.is_(None))
+        .where(CrawledItem.content_body.is_(None))
+        .where(CrawledItem.authority_tier.in_((1, 2)))
+        .where(CrawledItem.source.in_(_NO_DOI_ACADEMIC_SOURCES))
+        .order_by(_priority, desc(CrawledItem.collected_at))
+        .limit(batch_size)
+    )
+    rows_with_attempts = result.fetchall()
+    if not rows_with_attempts:
+        return 0
+    attempts_by_id = {rid: attempts for rid, _url, attempts in rows_with_attempts}
+
+    async def _fetch_one(row_id, url):
+        try:
+            if url.lower().split("?")[0].endswith(".pdf"):
+                text = await fetch_pdf_url(client, url)
+            else:
+                text = await fetch_html_and_extract(client, url)
+            return row_id, text, None
+        except Exception as exc:
+            return row_id, None, exc
+
+    results = await asyncio.gather(*(_fetch_one(rid, url) for rid, url, _ in rows_with_attempts))
+
+    async def _write(row_id, content_body_value):
+        try:
+            async with session.begin_nested():
+                await session.execute(
+                    update(CrawledItem).where(CrawledItem.id == row_id)
+                    .values(content_body=content_body_value)
+                )
+        except Exception as exc:
+            logger.warning("enrich_no_doi_urls: write failed for row %s: %s", row_id, exc)
+
+    for row_id, text, exc in results:
+        if exc is not None:
+            logger.debug("enrich_no_doi_urls: fetch error for row %s: %s", row_id, exc)
+        if text:
+            await _write(row_id, text)
+            updated += 1
+            continue
+
+        # No content (fetch error, or fetched OK but nothing extractable) —
+        # same per-URL give-up rule as enrich_fulltext's stage 3.
+        new_attempts = attempts_by_id.get(row_id, 0) + 1
+        if new_attempts >= _URL_GIVE_UP_AFTER_ATTEMPTS:
+            await _write(row_id, "")
+            logger.info(
+                "enrich_no_doi_urls: giving up on row %s after %d failed attempts",
+                row_id, new_attempts,
+            )
+            continue
+        try:
+            async with session.begin_nested():
+                await session.execute(
+                    update(CrawledItem).where(CrawledItem.id == row_id)
+                    .values(fetch_attempts=new_attempts)
+                )
+        except Exception as exc:
+            logger.warning("enrich_no_doi_urls: attempt-count write failed for row %s: %s", row_id, exc)
+
+    await session.commit()
+    return updated
+
+
 async def enrich_fulltext_loop() -> None:
     """Long-running loop: enriches academic records with full text, cycling
     every _interval seconds between runs (see that constant below for the
@@ -1166,9 +1279,12 @@ async def enrich_fulltext_loop() -> None:
               URL from Unpaywall and store it in oa_url.
     Step 2 — enrich_fulltext: for every item with oa_url set, fetch and store
               the actual HTML/PDF content into content_body.
+    Step 3 — enrich_no_doi_urls: academic-API records with NO DOI at all
+              (invisible to steps 1-2, which both require one) — fetch
+              content directly from the record's own url instead.
 
-    Both steps must run in order — fulltext has nothing to fetch until
-    Unpaywall has populated oa_url.
+    Steps 1-2 must run in order — fulltext has nothing to fetch until
+    Unpaywall has populated oa_url. Step 3 is independent of both.
     """
     import asyncio as _asyncio
     _interval = 5 * 60  # was 30 min (originally 6h) — a 500-item batch now
@@ -1199,6 +1315,11 @@ async def enrich_fulltext_loop() -> None:
             async with AsyncSessionLocal() as session:
                 ft_count = await enrich_fulltext(session)
                 logger.info("enrich_fulltext: enriched %d records with full text", ft_count)
+
+            # Step 3: academic-API records with no DOI — fetch by url directly
+            async with AsyncSessionLocal() as session:
+                no_doi_count = await enrich_no_doi_urls(session)
+                logger.info("enrich_no_doi_urls: enriched %d records with content", no_doi_count)
         except Exception as exc:
             logger.error("enrich_fulltext loop error: %s", exc)
         await _asyncio.sleep(_interval)

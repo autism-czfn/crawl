@@ -32,10 +32,27 @@ def _clean(text: str) -> str | None:
     return text[:_MAX_CHARS]
 
 
-async def _fetch_bytes(client, url: str, timeout: int = 30) -> bytes | None:
-    """GET url → raw bytes, or None on any error."""
+async def _fetch_bytes(client, url: str) -> bytes | None:
+    """GET url → raw bytes, or None on any error.
+
+    BUG FIXED 2026-09-12: this used to call client.get(url, timeout=...,
+    follow_redirects=True) — but `client` here is always the shared
+    RateLimitedClient (src/http/client.py), whose .get() signature is
+    (url, headers=None, params=None, use_browser_ua=False,
+    check_robots=False) and accepts neither kwarg. Every call raised
+    TypeError, silently caught below and logged only at DEBUG (invisible
+    in normal operation), returning None — meaning every function in this
+    file that calls _fetch_bytes (fetch_pmc_fulltext's HTML+XML paths,
+    fetch_europepmc_fulltext, fetch_html_and_extract, fetch_pdf_url,
+    fetch_biorxiv_fulltext) has been silently non-functional. No
+    replacement kwargs needed: RateLimitedClient's underlying httpx client
+    already sets follow_redirects=True and a connect=10s/read=30s/
+    write=30s/pool=30s timeout globally at construction (see
+    RateLimitedClient.__init__) — this was always redundant, just
+    incompatible with the wrapper.
+    """
     try:
-        resp = await client.get(url, timeout=timeout, follow_redirects=True)
+        resp = await client.get(url)
         resp.raise_for_status()
         return resp.content
     except Exception as exc:
@@ -148,8 +165,13 @@ async def fetch_html_and_extract(client, url: str) -> str | None:
 
 
 async def fetch_pdf_url(client, pdf_url: str) -> str | None:
-    """Fetch and extract text from a PDF at the given URL."""
-    pdf_bytes = await _fetch_bytes(client, pdf_url, timeout=60)
+    """Fetch and extract text from a PDF at the given URL.
+
+    No custom timeout for large PDFs anymore — RateLimitedClient has no
+    per-call override (see _fetch_bytes' docstring); relies on its global
+    30s read timeout instead.
+    """
+    pdf_bytes = await _fetch_bytes(client, pdf_url)
     if not pdf_bytes:
         return None
     text = _extract_pdf_text(pdf_bytes)

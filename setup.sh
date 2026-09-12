@@ -555,7 +555,7 @@ PYEOF
 # ── Option 10 — Show crawled full articles by track ───────────────────────────
 show_track_stats() {
     echo
-    info "=== Crawled Full Articles by Track (Tier 1 & Tier 2) ==="
+    info "=== Backlog & Discovery Report (Tier 1 & Tier 2) ==="
     info "Report generated at (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
     echo
 
@@ -594,91 +594,21 @@ RESET = "\033[0m"
 # full text (see src/pipeline.py enrich_unpaywall/enrich_fulltext).
 FULL_TEXT_MIN_LEN = 1000
 
-def bar(n, total, width=20):
-    if total == 0:
-        return "[" + "-" * width + "]"
-    filled = int(round(n / total * width))
-    return "[" + "█" * filled + "─" * (width - filled) + "]"
-
-def pct(n, total):
-    return f"{n/total*100:.0f}%" if total else "─"
-
 try:
     import psycopg2
     conn = psycopg2.connect(db_url)
     cur  = conn.cursor()
 
-    # A track/domain_tag is unnested from the domain_tags jsonb array, same
-    # approach as the crawl_domain_tag_coverage view (migration 0020) — an
-    # item tagged ["sleep","eating"] is correctly counted under both, not
-    # just its first tag. Scoped to Tier 1/2 only, matching this project's
-    # standing focus (see crawl.txt).
-    cur.execute(f"""
-        SELECT
-            domain_value AS track,
-            COUNT(*) AS total,
-            COUNT(*) FILTER (WHERE LENGTH(content_body) >= {FULL_TEXT_MIN_LEN}) AS full_text,
-            COUNT(*) FILTER (WHERE content_body IS NOT NULL
-                              AND LENGTH(content_body) < {FULL_TEXT_MIN_LEN}) AS abstract_only,
-            COUNT(*) FILTER (WHERE authority_tier = 1) AS tier1_total,
-            COUNT(*) FILTER (WHERE authority_tier = 1
-                              AND LENGTH(content_body) >= {FULL_TEXT_MIN_LEN}) AS tier1_full,
-            COUNT(*) FILTER (WHERE authority_tier = 2) AS tier2_total,
-            COUNT(*) FILTER (WHERE authority_tier = 2
-                              AND LENGTH(content_body) >= {FULL_TEXT_MIN_LEN}) AS tier2_full
-        FROM crawled_items,
-             LATERAL jsonb_array_elements_text(
-                 COALESCE(domain_tags, '[]'::jsonb)
-             ) AS domain_value
-        WHERE authority_tier IN (1, 2)
-        GROUP BY domain_value
-        ORDER BY total DESC;
-    """)
-    rows = cur.fetchall()
-
-    if not rows:
-        print(f"  {WARN}No Tier 1/2 items with a domain_tags value found.{RESET}")
-    else:
-        print(f"  {BOLD}{'Track':<14} {'Total':>6} {'FullTxt':>7} {'Abstract':>8} "
-              f"{'T1 total':>8} {'T1 full':>7} {'T2 total':>8} {'T2 full':>7}  Coverage{RESET}")
-        print(f"  {'─'*14} {'─'*6} {'─'*7} {'─'*8} {'─'*8} {'─'*7} {'─'*8} {'─'*7}  {'─'*22}")
-
-        sum_total = sum_full = sum_abstract = 0
-        sum_t1_total = sum_t1_full = sum_t2_total = sum_t2_full = 0
-
-        for (track, total, full_text, abstract_only,
-             t1_total, t1_full, t2_total, t2_full) in rows:
-            cov_bar = bar(full_text, total)
-            print(f"  {track:<14} {total:>6,} {full_text:>7,} {abstract_only:>8,} "
-                  f"{t1_total:>8,} {t1_full:>7,} {t2_total:>8,} {t2_full:>7,}  "
-                  f"{cov_bar} {pct(full_text, total):>4}")
-            sum_total      += total
-            sum_full       += full_text
-            sum_abstract   += abstract_only
-            sum_t1_total   += t1_total
-            sum_t1_full    += t1_full
-            sum_t2_total   += t2_total
-            sum_t2_full    += t2_full
-
-        print(f"  {'─'*14} {'─'*6} {'─'*7} {'─'*8} {'─'*8} {'─'*7} {'─'*8} {'─'*7}")
-        print(f"  {BOLD}{'TOTAL':<14} {sum_total:>6,} {sum_full:>7,} {sum_abstract:>8,} "
-              f"{sum_t1_total:>8,} {sum_t1_full:>7,} {sum_t2_total:>8,} {sum_t2_full:>7,}{RESET}")
-
-        print()
-        print(f"  {DIM}\"Total\" counts an item once per track it's tagged with — an "
-              f"item tagged [\"sleep\",\"eating\"] counts under both, so the column "
-              f"(and the TOTAL row below it) doesn't sum to the DB's total row count.{RESET}")
-        print(f"  {DIM}\"FullTxt\" = content_body >= {FULL_TEXT_MIN_LEN} chars. "
-              f"\"Abstract\" = has content_body but shorter (pre-enrichment academic "
-              f"records) or empty-string permanent-failure sentinels.{RESET}")
-        print()
-
     # ── Source breakdown by track: crawl vs claude -p WebSearch discovery ──
     # crawled_items.source is 'claude_websearch' for rows landed by
     # src/discovery/loop.py (crawl.txt section 13's "第4层" WebSearch
     # supplement) and the collector's own platform name (html_crawl,
-    # sitemap, pubmed, ...) for everything else. Same FULL_TEXT_MIN_LEN
-    # threshold and per-track unnesting as the table above.
+    # sitemap, pubmed, ...) for everything else. FullTxt here uses
+    # FULL_TEXT_MIN_LEN (content_body >= 1000 chars), same threshold used
+    # throughout this report. A track/domain_tag is unnested from the
+    # domain_tags jsonb array (same approach as the crawl_domain_tag_
+    # coverage view, migration 0020) — an item tagged ["sleep","eating"]
+    # is correctly counted under both, not just its first tag.
     cur.execute(f"""
         SELECT
             domain_value AS track,
@@ -722,42 +652,50 @@ try:
         print(f"  {DIM}\"WebSearch\" = source='claude_websearch' (src/discovery/loop.py — the "
               f"claude -p WebSearch discovery layer, crawl.txt section 13). \"Crawl\" = "
               f"everything else (official APIs, sitemap/RSS, html_crawl/playwright_crawl). "
-              f"Same per-track double-counting caveat as the table above applies.{RESET}")
+              f"\"Total\" counts an item once per track it's tagged with — an item tagged "
+              f"[\"sleep\",\"eating\"] counts under both, so the TOTAL row doesn't sum to the "
+              f"DB's total row count (same caveat applies to every by-track table below).{RESET}")
         print()
 
     # ── Unprocessed queue by track (how bad is the backlog) ──
-    # Six mutually-exclusive, collectively-exhaustive buckets per row, so
+    # Four mutually-exclusive, collectively-exhaustive columns per row, so
     # they sum exactly to "Total" (every Tier 1/2 item with this domain tag
-    # falls into exactly one, based on (doi, open_access, oa_url,
-    # content_body) — see the FILTER clauses below for the precise split):
-    #   no_doi             — no DOI at all; never enters this pipeline
-    #   awaiting_oa_check  — has a DOI, Unpaywall hasn't been asked yet (or
-    #                        was asked and said OA but we still lack a URL)
-    #   not_open_access    — Unpaywall was asked and said no free copy exists
-    #   awaiting_fulltext  — Unpaywall already gave us a real oa_url, but
-    #                        enrich_fulltext hasn't fetched/parsed it yet
-    #   skipped_error      — enrich_fulltext gave up permanently: a domain
-    #                        that's never once succeeded, 24h after its
-    #                        first failure (migration 0025); a single URL
-    #                        given up on after 3 failed attempts of its own
-    #                        (same migration — used for domains that HAVE
-    #                        succeeded before, so aren't blacklisted
-    #                        wholesale); a domain manually marked dead via
-    #                        a "blocked_domain" entry in config/surfaces.json
-    #                        (see the "Manually skipped" breakdown further
-    #                        below); a paywall/low-quality page; or a PDF
-    #                        that failed to parse. Written as '' (empty
-    #                        string, NOT NULL) so it stops occupying
-    #                        "awaiting fulltext" — see _write()'s docstring
-    #                        in src/pipeline.py.
-    #   downloaded         — fetched and parsed successfully; real content
-    #
-    # "Manually skipped" (config/surfaces.json's blocked_domain list) is
-    # deliberately NOT a column here — it's a cross-cutting subset that can
-    # land in EITHER awaiting_fulltext or skipped_error depending on
-    # whether it's been attempted yet, so adding it as its own column would
-    # double-count and break the sum-to-Total property. It's still fully
-    # broken out in the "Manually skipped" section further below.
+    # falls into exactly one — see the FILTER clauses below for the
+    # precise, disjoint split):
+    #   downloaded  — fetched and parsed successfully; real content
+    #                 (content_body >= FULL_TEXT_MIN_LEN chars, ANY source)
+    #   waiting     — genuinely queued for an automated retry:
+    #                   • has a DOI, Unpaywall hasn't been asked yet (or
+    #                     said OA but we still lack a URL)
+    #                   • Unpaywall gave a real oa_url, not fetched yet
+    #                   • NO DOI, but from a source enrich_no_doi_urls
+    #                     covers (src/pipeline.py's _NO_DOI_ACADEMIC_SOURCES:
+    #                     openalex/core/europepmc/doaj/semanticscholar/
+    #                     pubmed/clinicaltrials) — fetched by url directly,
+    #                     no DOI needed
+    #   skipped     — a permanent negative outcome, won't be retried:
+    #                   • Unpaywall confirmed no free copy exists
+    #                   • enrich_fulltext gave up after failures (never-
+    #                     succeeded domain given up 24h after first
+    #                     failure, migration 0025; or a single URL given up
+    #                     after 3 attempts of its own); written as '' so it
+    #                     stops occupying "waiting" — see _write()'s
+    #                     docstring in src/pipeline.py
+    #                   • a domain manually marked dead via a
+    #                     "blocked_domain" entry in config/surfaces.json
+    #                     (see the "Manually skipped" breakdown further
+    #                     below)
+    #                   • NO DOI, from a source enrich_no_doi_urls does NOT
+    #                     cover (youtube, html_crawl, search_websearch_queue,
+    #                     claude_websearch, rss, sitemap, playwright_crawl,
+    #                     nhs_api, cdc_data) — nothing will ever fetch these
+    #                     automatically, so they belong with the other
+    #                     permanent outcomes, not "waiting"
+    #   abstract    — has SOME content, just shorter than FULL_TEXT_MIN_LEN.
+    #                 Permanently stuck there: enrich_fulltext's (and
+    #                 enrich_no_doi_urls') own query requires content_body
+    #                 IS NULL to even consider a row, so an item that
+    #                 already has short content is NEVER revisited.
     surfaces_path = pathlib.Path("config/surfaces.json")
     blocked_domains = []
     if surfaces_path.exists():
@@ -772,39 +710,59 @@ try:
             print(f"  {WARN}Failed to parse config/surfaces.json: {exc}{RESET}")
     blocked_patterns = [f"%{d}%" for d in blocked_domains]
 
-    cur.execute("""
+    # No-DOI items split by whether enrich_no_doi_urls (src/pipeline.py)
+    # actually covers their source — keep this literally in sync with that
+    # function's _NO_DOI_ACADEMIC_SOURCES tuple.
+    _no_doi_retriable_sources = (
+        'openalex', 'core', 'europepmc', 'doaj',
+        'semanticscholar', 'pubmed', 'clinicaltrials',
+    )
+
+    # Every FILTER's WHERE is an explicit, disjoint condition (not relying
+    # on evaluation order), so this is a true mutually-exclusive partition
+    # of every Tier 1/2 item tagged with this track — see the comment block
+    # above for what each column merges together.
+    cur.execute(f"""
         SELECT
             domain_value AS track,
             COUNT(*) AS total,
-            COUNT(*) FILTER (WHERE doi IS NULL) AS no_doi,
+            COUNT(*) FILTER (WHERE length(content_body) >= {FULL_TEXT_MIN_LEN}) AS downloaded,
             COUNT(*) FILTER (
-                WHERE doi IS NOT NULL
-                  AND (open_access IS NULL
-                       OR (open_access = true AND oa_url IS NULL))
-            ) AS awaiting_oa_check,
+                WHERE (content_body IS NULL OR content_body = '')
+                  AND (
+                    (doi IS NOT NULL AND (
+                        (open_access IS NULL OR (open_access = true AND oa_url IS NULL))  -- awaiting_oa_check
+                        OR (content_body IS NULL AND open_access = true AND oa_url IS NOT NULL)  -- awaiting_fulltext
+                    ))
+                    OR (doi IS NULL AND source = ANY(%(retriable)s))  -- no-DOI, but enrich_no_doi_urls covers it
+                  )
+            ) AS waiting,
             COUNT(*) FILTER (
-                WHERE doi IS NOT NULL AND open_access = false
-            ) AS not_open_access,
+                WHERE (content_body IS NULL OR content_body = '')
+                  AND (
+                    (doi IS NOT NULL AND (
+                        open_access = false  -- not_open_access (guard above excludes
+                                             -- the rare case where content_body is
+                                             -- already populated from a non-OA source
+                                             -- despite Unpaywall saying not-OA — that
+                                             -- counts as "downloaded" instead)
+                        OR (content_body = '' AND open_access = true AND oa_url IS NOT NULL)  -- skipped_error
+                    ))
+                    OR (doi IS NULL AND NOT (source = ANY(%(retriable)s)))  -- no-DOI, nothing will ever fetch it
+                  )
+            ) AS skipped,
             COUNT(*) FILTER (
-                WHERE open_access = true AND content_body IS NULL
-                  AND doi IS NOT NULL AND oa_url IS NOT NULL
-            ) AS awaiting_fulltext,
-            COUNT(*) FILTER (
-                WHERE open_access = true AND content_body = ''
-                  AND doi IS NOT NULL AND oa_url IS NOT NULL
-            ) AS skipped_error,
-            COUNT(*) FILTER (
-                WHERE open_access = true AND content_body IS NOT NULL AND content_body != ''
-                  AND doi IS NOT NULL AND oa_url IS NOT NULL
-            ) AS downloaded
+                WHERE content_body IS NOT NULL AND content_body != ''
+                  AND length(content_body) < {FULL_TEXT_MIN_LEN}
+            ) AS abstract
         FROM crawled_items,
              LATERAL jsonb_array_elements_text(
                  COALESCE(domain_tags, '[]'::jsonb)
              ) AS domain_value
         WHERE authority_tier IN (1, 2)
         GROUP BY domain_value
-        ORDER BY awaiting_fulltext DESC;
-    """)
+        ORDER BY waiting DESC;
+    """, {"retriable": list(_no_doi_retriable_sources)})
     queue_rows = cur.fetchall()
 
     print(f"  {BOLD}{'─'*70}{RESET}")
@@ -814,11 +772,8 @@ try:
     if not queue_rows:
         print(f"  {WARN}No Tier 1/2 queue data found.{RESET}")
     else:
-        cols = [
-            ("Total", 9), ("No DOI", 8), ("Awaiting OA-check", 18),
-            ("Not open access", 16), ("Awaiting fulltext", 18),
-            ("Skipped (error)", 16), ("Downloaded", 11),
-        ]
+        cols = [("Total", 9), ("FullTxt Downloaded", 19), ("Waiting", 9), ("Skipped", 9), ("Abstract", 9)]
+
         header = f"  {BOLD}{'Track':<14} " + " ".join(f"{name:>{w}}" for name, w in cols) + RESET
         rule = f"  {'─'*14} " + " ".join('─'*w for _, w in cols)
         print(header)
@@ -827,49 +782,46 @@ try:
         sums = [0] * len(cols)
         for row in queue_rows:
             track = row[0]
-            values = row[1:]
+            values = row[1:1 + len(cols)]
             print(f"  {track:<14} " + " ".join(f"{v:>{w},}" for v, (_, w) in zip(values, cols)))
             sums = [s + v for s, v in zip(sums, values)]
 
         print(rule)
         print(f"  {BOLD}{'TOTAL':<14} " + " ".join(f"{v:>{w},}" for v, (_, w) in zip(sums, cols)) + RESET)
         print()
-        print(f"  {DIM}Every column but \"Total\" is mutually exclusive — they always sum to "
-              f"it exactly. \"No DOI\" = never enters THIS pipeline — it does NOT mean no "
-              f"content: plenty of these were fetched directly by other crawl paths (RSS/"
-              f"sitemap/html_crawl/API sources with no DOI to check). \"Downloaded\" below is "
-              f"scoped ONLY to successes via this DOI→Unpaywall→fetch pipeline, so it "
-              f"undercounts real full-text articles — for the true total (any source), use "
-              f"\"FullTxt\" in the \"Crawled Full Articles by Track\" table above instead. "
-              f"\"Awaiting OA-check\" = has a DOI, hasn't been asked to Unpaywall yet (runs in "
-              f"batches of 3000 every 5 min). \"Not open access\" = Unpaywall was asked and confirmed "
-              f"no free copy exists — a final answer, not a retry candidate.{RESET}")
-        print(f"  {DIM}\"Awaiting fulltext\" = Unpaywall already gave us a real download URL, "
-              f"but the actual fetch+extract hasn't happened yet. This does NOT mean these "
-              f"will become real articles — most turn out paywalled/bot-blocked (mdpi.com, "
-              f"wiley, sagepub, sciencedirect, tandfonline, etc. routinely 403 us) and end up "
-              f"in \"Skipped (error)\" instead. This number just means \"gets a final answer "
-              f"next,\" not \"will succeed.\"{RESET}")
-        print(f"  {DIM}\"Skipped (error)\" = enrich_fulltext already gave up on these — a domain "
-              f"that never once succeeded, given up 24h after its first failure; a single URL "
-              f"given up after 3 failed attempts of its own; a manually-skipped dead domain "
-              f"({len(blocked_domains)} domain{'s' if len(blocked_domains) != 1 else ''} "
-              f"currently listed in config/surfaces.json — see the \"Manually skipped\" "
-              f"breakdown below); a paywall/low-quality page; or an unparseable PDF. Won't be "
-              f"retried unless the underlying block/skip is lifted. \"Downloaded\" = fetched "
-              f"and parsed successfully via THIS pipeline specifically — see the note under "
-              f"the table above before treating it as your full-text total.{RESET}")
+        print(f"  {DIM}Every column is mutually exclusive — they always sum to \"Total\" "
+              f"exactly. \"FullTxt Downloaded\" = content_body >= {FULL_TEXT_MIN_LEN} chars, "
+              f"ANY source — same \"FullTxt\" definition and threshold used in the source-"
+              f"breakdown table above.{RESET}")
+        print(f"  {DIM}\"Waiting\" = genuinely queued for an automated retry: Awaiting OA-check "
+              f"(has a DOI, hasn't been asked to Unpaywall yet) + Awaiting fulltext (Unpaywall "
+              f"gave a real URL, hasn't been fetched yet) + no-DOI items from a source "
+              f"enrich_no_doi_urls covers (OpenAlex/Core/EuropePMC/DOAJ/Semantic Scholar/"
+              f"PubMed/ClinicalTrials.gov — fetched by url directly, no DOI needed).{RESET}")
+        print(f"  {DIM}\"Skipped\" = a permanent negative outcome, won't be retried: Not open "
+              f"access (Unpaywall confirmed no free copy exists) + Skipped/error "
+              f"(enrich_fulltext gave up after failures — including "
+              f"{len(blocked_domains)} domain{'s' if len(blocked_domains) != 1 else ''} "
+              f"manually marked dead in config/surfaces.json, see the \"Manually skipped\" "
+              f"breakdown further below) + no-DOI items from a source nothing will ever fetch "
+              f"(YouTube — no caption available; html_crawl — extraction already failed once; "
+              f"WebSearch queue, RSS, sitemap, and a few smaller sources).{RESET}")
+        print(f"  {DIM}\"Abstract\" = has SOME content, just shorter than {FULL_TEXT_MIN_LEN} "
+              f"chars. Permanently stuck there, not \"Waiting\": enrich_fulltext's (and "
+              f"enrich_no_doi_urls') own query requires content_body IS NULL to even look at "
+              f"a row, so these are never revisited.{RESET}")
         print()
 
     # ── Manually skipped, one row per configured domain ────────────────────
-    # The "Manually skipped" column above is grouped by track (domain_value
-    # from domain_tags), so a matched item with an empty domain_tags array
-    # (jsonb_array_elements_text on '[]' yields zero rows) or with
-    # authority_tier NOT IN (1, 2) never surfaces there at all — even though
-    # it genuinely matched a blocked_domain pattern. That silently hides
-    # some of the 8 configured domains from the table above. This section
-    # lists all of them — always exactly len(blocked_domains) rows,
-    # regardless of tags/tier — so nothing configured here goes invisible.
+    # Manually-skipped items are folded into "Skipped" in the by-track
+    # table above (grouped by track via domain_tags), so a matched item
+    # with an empty domain_tags array (jsonb_array_elements_text on '[]'
+    # yields zero rows) or with authority_tier NOT IN (1, 2) never
+    # surfaces there at all — even though it genuinely matched a
+    # blocked_domain pattern. That silently hides some of the 8 configured
+    # domains from the table above. This section lists all of them —
+    # always exactly len(blocked_domains) rows, regardless of tags/tier —
+    # so nothing configured here goes invisible.
     if blocked_domains:
         cur.execute("""
             SELECT
@@ -901,8 +853,8 @@ try:
         print(f"  {DIM}\"Matched items\" = every crawled_items row (any tier, any/no domain_tags) "
               f"whose oa_url matches this domain. \"Shown above\" = how many of those also had a "
               f"non-empty domain_tags AND authority_tier in (1, 2), so they actually contribute "
-              f"to the \"Manually skipped\" column in the by-track table above. A domain with 0 "
-              f"matched items here simply has no crawled row with that oa_url yet.{RESET}")
+              f"to the \"Skipped\" column in the by-track table above. A domain with 0 matched "
+              f"items here simply has no crawled row with that oa_url yet.{RESET}")
         print()
 
     # ── WebSearch discovery queue (search repo's live-query fallback) ─────

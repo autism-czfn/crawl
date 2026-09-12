@@ -18,11 +18,14 @@ pipeline, no LLM-authored body/summary.
 from __future__ import annotations
 
 import logging
+import re
 
 import httpx
 from bs4 import BeautifulSoup
 from sqlalchemy import or_, select
 
+from src.collectors.base import CollectedItem
+from src.collectors.fulltext import fetch_pmc_fulltext
 from src.collectors.sitemap import _extract_page
 from src.http.client import get_shared_client
 from src.pipeline import _normalize_url, save_items
@@ -30,6 +33,44 @@ from src.storage.db import AsyncSessionLocal
 from src.storage.models import CrawledItem, Surface
 
 logger = logging.getLogger(__name__)
+
+# pmc.ncbi.nlm.nih.gov's human-facing HTML reader is behind bot/CAPTCHA
+# protection that the generic fetch below has no defense against — a
+# "Checking your browser - reCAPTCHA" challenge page was confirmed live
+# (2026-09-12) getting saved as real content (its own <title> passes
+# _extract_page's title check, so nothing here caught it: a captcha page
+# isn't a fetch error OR an empty-body extraction failure, just useless
+# content masquerading as a landed page). fetch_pmc_fulltext() already
+# solves this correctly elsewhere (src/collectors/pubmed.py) — it tries
+# the HTML reader first but falls back to NCBI's efetch XML API, the
+# sanctioned machine-access route that isn't guarded by the same
+# browser-facing challenge. Route PMC URLs through it here too.
+_PMC_URL_RE = re.compile(r"pmc\.ncbi\.nlm\.nih\.gov/articles/PMC(\d+)", re.IGNORECASE)
+
+
+async def _fetch_pmc_title(client, numeric_id: str) -> str | None:
+    """Look up a PMC article's title via NCBI's esummary API.
+
+    Deliberately NOT scraped from the HTML reader's <title> tag — that's
+    exactly what a CAPTCHA challenge page's title poisons (see the
+    docstring above _PMC_URL_RE). esummary is the same class of sanctioned
+    eutils endpoint as efetch, so it isn't subject to that protection.
+    """
+    from src.config import settings
+
+    params = {"db": "pmc", "id": numeric_id, "retmode": "json"}
+    if settings.PUBMED_API_KEY:
+        params["api_key"] = settings.PUBMED_API_KEY
+    try:
+        resp = await client.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+            params=params,
+        )
+        data = resp.json()
+        return data.get("result", {}).get(numeric_id, {}).get("title") or None
+    except Exception as exc:
+        logger.debug("PMC esummary title lookup failed for PMC%s: %s", numeric_id, exc)
+        return None
 
 # Distinguishes discovery-landed rows from every existing collector's
 # platform-name source value (e.g. "html_crawl", "sitemap", "pubmed") —
@@ -155,6 +196,38 @@ async def _already_known(session, url: str) -> bool:
     return result.first() is not None
 
 
+async def _land_pmc_url(
+    session, client, url: str, numeric_id: str, surface_key: str, source: str,
+) -> tuple[str, str | None]:
+    """land_one_url's PMC branch — see _PMC_URL_RE's docstring for why PMC
+    URLs can't go through the generic fetch+_extract_page path below."""
+    text = await fetch_pmc_fulltext(client, numeric_id)
+    if not text:
+        return "failed", "extract_failed"
+    title = await _fetch_pmc_title(client, numeric_id) or f"PMC{numeric_id}"
+    item: CollectedItem = {
+        "title": title,
+        "url": url,
+        "source": source,
+        "external_id": f"PMC{numeric_id}",
+        "description": None,
+        "content_body": text,
+        "author": None,
+        "authors_json": None,
+        "published_at": None,
+        "rank_position": None,
+        "doi": None,
+        "journal": "pmc.ncbi.nlm.nih.gov",
+        "open_access": True,
+        "engagement": {},
+        "raw_payload": {},
+    }
+    inserted = await save_items([item], surface_key, session)
+    if inserted:
+        return "landed", None
+    return "already_known", None
+
+
 async def land_one_url(
     session,
     client,
@@ -188,6 +261,10 @@ async def land_one_url(
         return "failed", "not_allowlisted"
     if await _already_known(session, url):
         return "already_known", None
+
+    pmc_match = _PMC_URL_RE.search(url)
+    if pmc_match:
+        return await _land_pmc_url(session, client, url, pmc_match.group(1), surface_key, source)
 
     try:
         page_resp = await client.get(url, use_browser_ua=True, check_robots=True)
