@@ -1312,13 +1312,19 @@ async def enrich_fulltext_loop() -> None:
                 # show a stale count from whichever earlier cycle last had
                 # a nonzero result, instead of the true, most recent one.
                 logger.info("enrich_unpaywall: resolved %d OA URLs", oa_count)
+            heartbeat("enrich_fulltext")
 
             # Step 2: fetch full text for items that now have an OA URL
             async with AsyncSessionLocal() as session:
                 ft_count = await enrich_fulltext(session)
                 logger.info("enrich_fulltext: enriched %d records with full text", ft_count)
+            heartbeat("enrich_fulltext")
 
             # Step 3: academic-API records with no DOI — fetch by url directly
+            # (this step alone can run long when several domains are actively
+            # blocking / circuit-breaker-OPEN, e.g. europepmc.org, doaj.org —
+            # heartbeating after steps 1-2 above means that doesn't, by
+            # itself, make the whole cycle look wedged; see src/health.py)
             async with AsyncSessionLocal() as session:
                 no_doi_count = await enrich_no_doi_urls(session)
                 logger.info("enrich_no_doi_urls: enriched %d records with content", no_doi_count)
