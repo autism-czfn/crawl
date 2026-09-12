@@ -220,10 +220,13 @@ async def run_once(max_items: int = _BATCH_SIZE) -> int:
 async def run_loop() -> None:
     """Long-running loop that chunks items periodically."""
     import asyncio
+    from src.health import register, heartbeat
+    register("chunk_pipeline", _INTERVAL_SEC)
     logger.info("Chunk pipeline started (interval=%ds)", _INTERVAL_SEC)
     while True:
         try:
             await run_once()
         except Exception as exc:
             logger.error("Chunk pipeline error: %s", exc)
+        heartbeat("chunk_pipeline")
         await asyncio.sleep(_INTERVAL_SEC)

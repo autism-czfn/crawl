@@ -179,6 +179,8 @@ async def subprocess_embedding_loop() -> None:
     available.  If not, waits _RAM_RETRY_SEC (2 min) and retries — this
     prevents the OOM killer from immediately killing the worker process.
     """
+    from src.health import register, heartbeat
+    register("embedding", _INTERVAL_SEC)
     logger.info(
         "Subprocess embedding loop started (interval=%ds) — "
         "model memory released between runs",
@@ -199,6 +201,7 @@ async def subprocess_embedding_loop() -> None:
                 "retrying in %ds",
                 free_mb, _MIN_FREE_MB, _RAM_RETRY_SEC,
             )
+            heartbeat("embedding")          # still alive, just RAM-gated — not stuck
             await asyncio.sleep(_RAM_RETRY_SEC)
             continue
 
@@ -248,6 +251,7 @@ async def subprocess_embedding_loop() -> None:
         except Exception as exc:
             logger.error("Failed to spawn embed_worker: %s", exc, exc_info=True)
 
+        heartbeat("embedding")
         await asyncio.sleep(_INTERVAL_SEC)
 
 

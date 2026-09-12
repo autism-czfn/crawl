@@ -10,6 +10,7 @@ from src.chunk_pipeline import run_loop as chunk_loop
 from src.discovery.loop import discovery_loop
 from src.discovery.search_queue_loop import search_queue_loop
 from src.embeddings import subprocess_embedding_loop as embedding_loop
+from src.health import serve as health_serve
 from src.pipeline import enrich_fulltext_loop, shutdown_pdf_pool
 from src.scheduler import Scheduler, log_health_metrics
 
@@ -87,6 +88,7 @@ async def main() -> None:
         asyncio.create_task(log_health_metrics()),
         asyncio.create_task(discovery_loop()),
         asyncio.create_task(search_queue_loop()),
+        asyncio.create_task(health_serve(settings.HEALTH_HOST, settings.HEALTH_PORT)),
     ]
 
     await stop_event.wait()

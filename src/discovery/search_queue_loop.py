@@ -97,12 +97,15 @@ _MIN_CONFIDENCE_TO_PROMOTE = "high"
 
 
 async def search_queue_loop() -> None:
+    from src.health import register, heartbeat
+    register("search_queue", _INTERVAL_SEC)
     logger.info("search discovery queue loop started (interval=%ds)", _INTERVAL_SEC)
     while True:
         try:
             await _run_one_cycle()
         except Exception as exc:
             logger.error("search queue loop error: %s", exc, exc_info=True)
+        heartbeat("search_queue")
         await asyncio.sleep(_INTERVAL_SEC)
 
 

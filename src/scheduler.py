@@ -66,9 +66,12 @@ class Scheduler:
         _playwright_semaphore = asyncio.Semaphore(_PLAYWRIGHT_CONCURRENCY)
         await self._seed_surfaces()
         logger.info("Scheduler started")
+        from src.health import register, heartbeat
+        register("scheduler", _TICK_INTERVAL_SEC)
 
         while self._running:
             await self._tick()
+            heartbeat("scheduler")
             self._tick_count += 1
             # Check Tier-1 staleness once per _STALENESS_CHECK_INTERVAL seconds
             if self._tick_count % (_STALENESS_CHECK_INTERVAL // _TICK_INTERVAL_SEC) == 0:
@@ -290,6 +293,8 @@ def _is_due(surface: Surface, now: datetime) -> bool:
 async def log_health_metrics() -> None:
     """Emit structured JSON health metrics every hour."""
     import json
+    from src.health import register, heartbeat
+    register("health_metrics", 3600)
     metrics_logger = logging.getLogger("crawl.metrics")
     while True:
         try:
@@ -321,4 +326,5 @@ async def log_health_metrics() -> None:
             }))
         except Exception as exc:
             metrics_logger.error("Health metrics error: %s", exc)
+        heartbeat("health_metrics")
         await asyncio.sleep(3600)

@@ -18,6 +18,10 @@ pdfplumber>=0.10
 youtube-transcript-api>=0.6
 yt-dlp>=2024.1.0
 
+# Health check API server (polled by ~/data/code/monitor)
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+
 # Django admin site
 django>=4.2.0
 psycopg2-binary>=2.9.0

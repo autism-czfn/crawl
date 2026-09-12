@@ -1287,6 +1287,7 @@ async def enrich_fulltext_loop() -> None:
     Unpaywall has populated oa_url. Step 3 is independent of both.
     """
     import asyncio as _asyncio
+    from src.health import register, heartbeat
     _interval = 5 * 60  # was 30 min (originally 6h) — a 500-item batch now
     # finishes in ~90s (connection-pool + connect-timeout fixes, 2026-09-10),
     # so 30 min of sleep after that was mostly idle time against a real
@@ -1298,6 +1299,7 @@ async def enrich_fulltext_loop() -> None:
     # than to isolated requests. 5 min is a middle ground: meaningfully more
     # throughput than 30 min, without hammering the same stuck items or
     # looking like sustained abuse to any one domain.
+    register("enrich_fulltext", _interval)
     logger.info("enrich_fulltext loop started (interval=%ds)", _interval)
     while True:
         try:
@@ -1322,4 +1324,5 @@ async def enrich_fulltext_loop() -> None:
                 logger.info("enrich_no_doi_urls: enriched %d records with content", no_doi_count)
         except Exception as exc:
             logger.error("enrich_fulltext loop error: %s", exc)
+        heartbeat("enrich_fulltext")
         await _asyncio.sleep(_interval)

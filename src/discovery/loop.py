@@ -78,6 +78,8 @@ def _startup_delay_seconds(
 
 
 async def discovery_loop() -> None:
+    from src.health import register, heartbeat
+    register("discovery", _INTERVAL_SEC)
     logger.info("discovery loop started (interval=%ds)", _INTERVAL_SEC)
 
     async with AsyncSessionLocal() as session:
@@ -96,6 +98,7 @@ async def discovery_loop() -> None:
         except Exception as exc:
             logger.error("discovery loop error: %s", exc, exc_info=True)
 
+        heartbeat("discovery")
         await asyncio.sleep(_INTERVAL_SEC)
 
 
