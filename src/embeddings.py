@@ -12,6 +12,9 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
+import re
+import subprocess
+import sys
 from datetime import datetime, timezone
 
 from sqlalchemy import select, update
@@ -27,9 +30,12 @@ EMBEDDING_SCHEMA_VERSION = "v2"
 logger = logging.getLogger(__name__)
 
 # Keep batches small to avoid OOM on ≤8 GB machines.
-# fastembed + 100 long chunks can spike to ~7 GB; 20 keeps peak well under 2 GB.
-_BATCH_SIZE = 20
-_CHUNK_BATCH_SIZE = 5         # chunks are longer text — keep very small to avoid OOM on 7.4 GB host
+# Measured live (2026-09-11): even at _BATCH_SIZE=20 the worker's RSS peaked
+# at ~5 GB (most of that is fixed ONNX runtime/model overhead, not just batch
+# data), which was enough to push an already memory-pressured host into swap
+# exhaustion. Lowered further as a mitigation.
+_BATCH_SIZE = 8
+_CHUNK_BATCH_SIZE = 2          # chunks are longer text — keep very small to avoid OOM
 _MAX_PER_RUN = 50             # reduced from 100; shorter runs = less chance of OOM from concurrent pressure
 _INTERVAL_SEC = 900  # 15 minutes
 
@@ -117,15 +123,46 @@ _RAM_RETRY_SEC = 120  # wait 2 min and re-check if RAM is insufficient
 
 
 def _free_ram_mb() -> int:
-    """Return available RAM in MB (MemAvailable from /proc/meminfo)."""
+    """Return available RAM in MB (best-effort, cross-platform).
+
+    Linux: MemAvailable from /proc/meminfo.
+    macOS: no /proc/meminfo exists, so this previously always fell through
+    to the "assume plenty" fallback below — silently disabling this guard
+    on macOS dev machines (confirmed live 2026-09-11: the guard never
+    engaged despite swap being ~97% full). Derive an equivalent from
+    `vm_stat` instead: free + inactive + speculative pages approximate
+    Linux's "available" semantics — reclaimable memory the kernel can hand
+    back without swapping.
+    """
     try:
         with open("/proc/meminfo") as f:
             for line in f:
                 if line.startswith("MemAvailable:"):
                     return int(line.split()[1]) // 1024
-    except Exception:
+    except FileNotFoundError:
         pass
-    return 9999  # assume plenty if we can't read
+    except Exception:
+        logger.debug("Failed to read /proc/meminfo", exc_info=True)
+
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(
+                ["vm_stat"], capture_output=True, text=True, timeout=5, check=True
+            ).stdout
+            page_size = 16384  # default; overwritten below from the header line
+            header_match = re.search(r"page size of (\d+) bytes", out)
+            if header_match:
+                page_size = int(header_match.group(1))
+            pages = {
+                m.group(1): int(m.group(2))
+                for m in re.finditer(r"Pages (free|inactive|speculative):\s+(\d+)\.", out)
+            }
+            available_pages = pages.get("free", 0) + pages.get("inactive", 0) + pages.get("speculative", 0)
+            return (available_pages * page_size) // (1024 * 1024)
+        except Exception:
+            logger.debug("Failed to read vm_stat", exc_info=True)
+
+    return 9999  # assume plenty if we can't determine (unsupported platform)
 
 
 async def subprocess_embedding_loop() -> None:
@@ -142,8 +179,6 @@ async def subprocess_embedding_loop() -> None:
     available.  If not, waits _RAM_RETRY_SEC (2 min) and retries — this
     prevents the OOM killer from immediately killing the worker process.
     """
-    import sys
-
     logger.info(
         "Subprocess embedding loop started (interval=%ds) — "
         "model memory released between runs",
@@ -168,6 +203,7 @@ async def subprocess_embedding_loop() -> None:
             continue
 
         logger.info("Spawning embed_worker subprocess (free RAM: %d MB) …", free_mb)
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, "-m", "src.embed_worker",
@@ -190,6 +226,25 @@ async def subprocess_embedding_loop() -> None:
                 )
             else:
                 logger.info("embed_worker subprocess finished cleanly (model memory released)")
+        except asyncio.CancelledError:
+            # main.py cancels this task on SIGTERM/SIGINT shutdown. Being
+            # cancelled only stops US awaiting proc.communicate() — it does
+            # NOT touch the child OS process, which loads several GB of
+            # embedding model weights. Left alone, it gets reparented to
+            # launchd/init and keeps running forever after the parent exits
+            # (confirmed live 2026-09-10: an embed_worker from the prior
+            # crawler process was still running, PPID 1, well after that
+            # process had been killed and replaced). Same failure mode
+            # src/main.py's shutdown handler already documents for the PDF
+            # process pool — that fix just doesn't reach this subprocess.
+            if proc is not None and proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+            raise
         except Exception as exc:
             logger.error("Failed to spawn embed_worker: %s", exc, exc_info=True)
 

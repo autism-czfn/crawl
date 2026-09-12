@@ -44,6 +44,11 @@ class CrawledItem(Base):
     embedded_at = Column(DateTime(timezone=True), nullable=True)
     oa_url = Column(Text, nullable=True)
     last_harvested_at = Column(DateTime(timezone=True), nullable=True)
+    # Added migration 0025: counts enrich_fulltext() failed attempts on
+    # this URL specifically (any failure type). At 3, the URL is given up
+    # on individually (content_body written as '') regardless of its
+    # domain's status — see src/pipeline.py enrich_fulltext().
+    fetch_attempts = Column(Integer, nullable=False, default=0)
     # Sprint 1-C: re-chunk trigger
     needs_rechunk = Column(Boolean, nullable=False, default=False)
     # Sprint 2-F: staleness flag
@@ -157,6 +162,11 @@ class BlockedDomain(Base):
     given_up = Column(Boolean, nullable=False, default=False)
     given_up_at = Column(DateTime(timezone=True), nullable=True)
     last_checked_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    # Added migration 0025: given_up is now decided by these two, not
+    # consecutive_403_count (kept, informational only) — see
+    # enrich_fulltext()'s domain give-up block in src/pipeline.py.
+    ever_succeeded = Column(Boolean, nullable=False, default=False)
+    first_failure_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class DiscoveryQueueState(Base):

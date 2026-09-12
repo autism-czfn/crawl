@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import socket
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -14,6 +15,31 @@ from src.config import settings
 from src.http.jitter import exponential_backoff
 
 logger = logging.getLogger(__name__)
+
+
+def _is_dns_failure(exc: BaseException) -> bool:
+    """True if a connection failure was specifically DNS resolution
+    (getaddrinfo) failing to resolve the hostname at all, as opposed to a
+    reachable host timing out, refusing the connection, or failing a TLS
+    handshake. Distinguishing this matters: a burst of DNS failures across
+    many unrelated domains at once means OUR network/DNS resolver is
+    having a problem, not that a bunch of different sites all went down —
+    that distinction determines what's worth investigating.
+
+    Walks the exception's __cause__ chain for a socket.gaierror — what
+    CPython's socket module raises for getaddrinfo failures on every OS —
+    with a string-match fallback in case some layer of httpx/anyio wraps
+    it without preserving that chain.
+    """
+    cause: BaseException | None = exc
+    for _ in range(5):
+        if isinstance(cause, socket.gaierror):
+            return True
+        cause = getattr(cause, "__cause__", None)
+        if cause is None:
+            break
+    msg = str(exc)
+    return "nodename nor servname" in msg or "Name or service not known" in msg or "Temporary failure in name resolution" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -55,22 +81,44 @@ class TokenBucket:
 class CircuitBreaker:
     threshold = 5
     cooldown_sec = 300
+    # Safety net for the half-open probe slot below: if whichever caller won
+    # it never reports back via record_success/record_failure (e.g. it hit
+    # an exception type the retry loop in request() doesn't catch, so
+    # neither gets called), don't let the breaker wedge shut forever — treat
+    # the slot as abandoned after this long and let a fresh probe through.
+    # Comfortably above request()'s own per-attempt timeout.
+    half_open_probe_timeout_sec = 60
 
-    def __init__(self) -> None:
+    def __init__(self, domain: str = "") -> None:
+        self.domain = domain
         self.state = "closed"
         self.failures = 0
         self.opened_at: float | None = None
+        self._half_open_probe_started_at: float | None = None
 
     def record_success(self) -> None:
         self.failures = 0
         self.state = "closed"
+        self._half_open_probe_started_at = None
 
     def record_failure(self) -> None:
         self.failures += 1
+        self._half_open_probe_started_at = None
+        if self.state == "open":
+            # Already open and cooling down — this is a trailing failure
+            # from a call that started (and passed allow_request()) before
+            # the breaker tripped, e.g. one of a domain's other concurrent
+            # in-flight requests each independently retrying up to 3x. It
+            # doesn't mean the breaker "reopened"; don't push opened_at (and
+            # therefore the 5-minute cooldown) further out for it, and don't
+            # re-log — confirmed live 2026-09-10: doi.org logged "OPEN"
+            # twice 2s apart, nowhere near the real 300s cooldown, from
+            # exactly this.
+            return
         if self.failures >= self.threshold:
             self.state = "open"
             self.opened_at = time.monotonic()
-            logger.warning("Circuit breaker OPEN")
+            logger.warning("Circuit breaker OPEN for %s", self.domain or "?")
 
     def allow_request(self) -> bool:
         if self.state == "closed":
@@ -78,9 +126,35 @@ class CircuitBreaker:
         if self.state == "open":
             if self.opened_at and time.monotonic() - self.opened_at > self.cooldown_sec:
                 self.state = "half_open"
-                return True
+            else:
+                return False
+        # half_open: let exactly ONE probe through at a time, tracked by a
+        # timestamp rather than a plain bool so a probe whose outcome never
+        # gets recorded doesn't wedge this domain shut permanently (see
+        # half_open_probe_timeout_sec above).
+        #
+        # Bug this replaces (found 2026-09-10, from crawler.log showing
+        # 95k+ "Circuit breaker OPEN" lines over ~2 weeks, dominated by
+        # doi.org): the old code returned True unconditionally for every
+        # caller while state == "half_open", with no notion of a probe
+        # already being in flight. Every task waiting on this domain
+        # (concurrency is 3 by default) would see the elapsed cooldown at
+        # once and ALL rush doi.org simultaneously instead of one canary
+        # request checking first. Since `failures` is never reset except on
+        # success, a single failure among that herd immediately reopens the
+        # breaker for another 5 minutes — and sending 3 requests instead of
+        # 1 into a still-fragile target raises the odds that at least one
+        # of them fails (1-0.8^3 ≈ 49% vs. 20% for a lone probe at 80%
+        # success), so recovery got harder to observe, not easier, the more
+        # concurrency a domain had.
+        now = time.monotonic()
+        if (
+            self._half_open_probe_started_at is not None
+            and now - self._half_open_probe_started_at < self.half_open_probe_timeout_sec
+        ):
             return False
-        return True  # half_open: allow one probe
+        self._half_open_probe_started_at = now
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +306,41 @@ class RateLimitedClient:
         self._server_advertised_rps: dict[str, float] = {}  # last value applied, to log only on change
         self._client = httpx.AsyncClient(
             follow_redirects=True,
-            timeout=httpx.Timeout(30.0),
+            # A flat 30s applied to connect AND read let one stuck TCP/TLS
+            # handshake hold a domain's concurrency slot (only 3 by default)
+            # for 30s per failed attempt, up to 3 attempts — a single
+            # unreachable item could tie up a slot for ~90s+backoff, and with
+            # the domain's other queued items stuck behind it, dragged a
+            # batch's tail out to 20+ minutes. Confirmed live 2026-09-10:
+            # doi.org repeatedly stalling on a handful of DOIs individually,
+            # each retried 3x at up to 30s/attempt, kept the SAME few items
+            # occupying doi.org's 3 concurrency slots across many progress
+            # checkpoints spanning ~20 minutes. Tightening connect (a real
+            # unreachable host fails to even open a socket almost
+            # immediately, never near 30s — every manual check here
+            # connected in <100ms) while leaving read/write generous means a
+            # genuinely slow-but-working download (e.g. a large PDF) is
+            # unaffected, but a stalled/unreachable connect attempt frees
+            # the slot in a third of the time.
+            timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0),
+            # httpx defaults to a 100-connection GLOBAL pool cap (all domains
+            # combined) when this isn't set — completely separate from, and
+            # far tighter than, the per-domain semaphores above (capped at 3
+            # each). That's invisible right up until a batch spans enough
+            # distinct domains to exceed 100 in flight at once: everything
+            # past the 100th queues for a pool slot and, if it doesn't get
+            # one within the 30s timeout above, fails with a PoolTimeout —
+            # which looks IDENTICAL to a real network timeout in the log
+            # (caught by the same `except httpx.TimeoutException` below) even
+            # though the actual target site was never even contacted.
+            # Confirmed live 2026-09-10: raising enrich_fulltext's batch_size
+            # 300→500 pushed a batch over this cap and produced a burst of
+            # simultaneous "Timeout/connect error" across totally unrelated
+            # domains (doi.org, dx.doi.org, half a dozen .ekb.eg journals at
+            # once) — while doi.org itself responded in <100ms to a direct
+            # curl run seconds later. This host's own fd ulimit is 1M+, so
+            # there's no real ceiling forcing 100 here.
+            limits=httpx.Limits(max_connections=300, max_keepalive_connections=50),
         )
 
     def _apply_server_rate_limit(self, domain: str, resp: httpx.Response) -> None:
@@ -266,7 +374,7 @@ class RateLimitedClient:
 
     def _breaker(self, domain: str) -> CircuitBreaker:
         if domain not in self._breakers:
-            self._breakers[domain] = CircuitBreaker()
+            self._breakers[domain] = CircuitBreaker(domain)
         return self._breakers[domain]
 
     async def get(
@@ -361,7 +469,20 @@ class RateLimitedClient:
                     if attempt == 2:
                         raise
                     wait = exponential_backoff(attempt)
-                    logger.warning("Timeout/connect error on %s — retrying in %.1fs: %s", domain, wait, exc)
+                    if _is_dns_failure(exc):
+                        # Distinct, greppable line (with the full URL, not
+                        # just the domain) — added 2026-09-11 after a ~2h
+                        # stretch where every domain failed with DNS errors
+                        # at once (local network issue, not any one site)
+                        # and the generic "Timeout/connect error" wording
+                        # made that hard to tell apart from a real per-site
+                        # timeout without reading each exception message.
+                        logger.warning(
+                            "DNS resolution failed for %s (domain %s) — retrying in %.1fs: %s",
+                            url, domain, wait, exc,
+                        )
+                    else:
+                        logger.warning("Timeout/connect error on %s — retrying in %.1fs: %s", domain, wait, exc)
                     await asyncio.sleep(wait)
 
             breaker.record_failure()

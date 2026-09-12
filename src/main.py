@@ -1,6 +1,10 @@
 import asyncio
 import logging
+import platform
+import re
 import signal
+import subprocess
+from datetime import datetime, timedelta
 from src.config import settings
 from src.chunk_pipeline import run_loop as chunk_loop
 from src.discovery.loop import discovery_loop
@@ -20,8 +24,34 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _system_boot_time_str() -> str:
+    """Best-effort OS boot time, so a log reader can tell a signal-driven
+    shutdown (SIGTERM from `kill`, or setup.sh's stop_existing()) apart from
+    the process having been killed out from under itself by a machine
+    reboot — the latter shows a boot time at (or a few seconds after) the
+    prior "Shutdown signal received" timestamp, with no start line in
+    between. Returns "unknown" rather than raising if the host doesn't
+    support either lookup (e.g. inside some minimal containers).
+    """
+    try:
+        if platform.system() == "Darwin":
+            out = subprocess.check_output(
+                ["sysctl", "-n", "kern.boottime"], text=True, timeout=5
+            )
+            m = re.search(r"sec = (\d+)", out)
+            if m:
+                return datetime.fromtimestamp(int(m.group(1))).strftime("%Y-%m-%d %H:%M:%S")
+        elif platform.system() == "Linux":
+            with open("/proc/uptime") as f:
+                uptime_seconds = float(f.read().split()[0])
+            return (datetime.now() - timedelta(seconds=uptime_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    return "unknown"
+
+
 async def main() -> None:
-    logger.info("Starting autism-crawler")
+    logger.info("Starting autism-crawler (system boot time: %s)", _system_boot_time_str())
     scheduler = Scheduler()
 
     # Plain SIGTERM (what a normal `kill <pid>` sends, and what setup.sh's
@@ -32,10 +62,22 @@ async def main() -> None:
     # docstring): the parent died, but its ProcessPoolExecutor children kept
     # running under PID 1 forever. Registering a handler here means SIGTERM
     # instead cancels the running tasks and lets us clean up before exiting.
+    #
+    # We also record *which* signal fired: SIGTERM is what both a normal
+    # `kill`/machine shutdown and setup.sh send, while SIGINT is Ctrl-C from
+    # an interactive terminal — logging the name (and, above, the OS boot
+    # time at startup) is what lets a future "why is it down?" be answered
+    # by grepping this log instead of cross-referencing `last reboot`.
     stop_event = asyncio.Event()
+    received_signal: dict[str, str] = {}
     loop = asyncio.get_running_loop()
+
+    def _on_signal(sig: signal.Signals) -> None:
+        received_signal["name"] = sig.name
+        stop_event.set()
+
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, stop_event.set)
+        loop.add_signal_handler(sig, _on_signal, sig)
 
     tasks = [
         asyncio.create_task(scheduler.run()),
@@ -48,7 +90,10 @@ async def main() -> None:
     ]
 
     await stop_event.wait()
-    logger.info("Shutdown signal received — cancelling tasks and cleaning up...")
+    logger.info(
+        "Shutdown signal received (%s) — cancelling tasks and cleaning up...",
+        received_signal.get("name", "unknown"),
+    )
 
     for t in tasks:
         t.cancel()

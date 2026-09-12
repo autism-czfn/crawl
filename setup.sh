@@ -725,24 +725,78 @@ try:
               f"Same per-track double-counting caveat as the table above applies.{RESET}")
         print()
 
-    # ── Unprocessed queue by track (how much backlog is sitting waiting) ──
-    # Two stages, matching src/pipeline.py:
+    # ── Unprocessed queue by track (how bad is the backlog) ──
+    # Six mutually-exclusive, collectively-exhaustive buckets per row, so
+    # they sum exactly to "Total" (every Tier 1/2 item with this domain tag
+    # falls into exactly one, based on (doi, open_access, oa_url,
+    # content_body) — see the FILTER clauses below for the precise split):
+    #   no_doi             — no DOI at all; never enters this pipeline
     #   awaiting_oa_check  — has a DOI, Unpaywall hasn't been asked yet (or
     #                        was asked and said OA but we still lack a URL)
+    #   not_open_access    — Unpaywall was asked and said no free copy exists
     #   awaiting_fulltext  — Unpaywall already gave us a real oa_url, but
     #                        enrich_fulltext hasn't fetched/parsed it yet
+    #   skipped_error      — enrich_fulltext gave up permanently: a domain
+    #                        that's never once succeeded, 24h after its
+    #                        first failure (migration 0025); a single URL
+    #                        given up on after 3 failed attempts of its own
+    #                        (same migration — used for domains that HAVE
+    #                        succeeded before, so aren't blacklisted
+    #                        wholesale); a domain manually marked dead via
+    #                        a "blocked_domain" entry in config/surfaces.json
+    #                        (see the "Manually skipped" breakdown further
+    #                        below); a paywall/low-quality page; or a PDF
+    #                        that failed to parse. Written as '' (empty
+    #                        string, NOT NULL) so it stops occupying
+    #                        "awaiting fulltext" — see _write()'s docstring
+    #                        in src/pipeline.py.
+    #   downloaded         — fetched and parsed successfully; real content
+    #
+    # "Manually skipped" (config/surfaces.json's blocked_domain list) is
+    # deliberately NOT a column here — it's a cross-cutting subset that can
+    # land in EITHER awaiting_fulltext or skipped_error depending on
+    # whether it's been attempted yet, so adding it as its own column would
+    # double-count and break the sum-to-Total property. It's still fully
+    # broken out in the "Manually skipped" section further below.
+    surfaces_path = pathlib.Path("config/surfaces.json")
+    blocked_domains = []
+    if surfaces_path.exists():
+        try:
+            import json as _json
+            all_surfaces = _json.loads(surfaces_path.read_text())
+            blocked_domains = [
+                s["blocked_domain"] for s in all_surfaces
+                if isinstance(s, dict) and s.get("blocked_domain")
+            ]
+        except Exception as exc:
+            print(f"  {WARN}Failed to parse config/surfaces.json: {exc}{RESET}")
+    blocked_patterns = [f"%{d}%" for d in blocked_domains]
+
     cur.execute("""
         SELECT
             domain_value AS track,
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE doi IS NULL) AS no_doi,
             COUNT(*) FILTER (
                 WHERE doi IS NOT NULL
                   AND (open_access IS NULL
                        OR (open_access = true AND oa_url IS NULL))
             ) AS awaiting_oa_check,
             COUNT(*) FILTER (
+                WHERE doi IS NOT NULL AND open_access = false
+            ) AS not_open_access,
+            COUNT(*) FILTER (
                 WHERE open_access = true AND content_body IS NULL
                   AND doi IS NOT NULL AND oa_url IS NOT NULL
-            ) AS awaiting_fulltext
+            ) AS awaiting_fulltext,
+            COUNT(*) FILTER (
+                WHERE open_access = true AND content_body = ''
+                  AND doi IS NOT NULL AND oa_url IS NOT NULL
+            ) AS skipped_error,
+            COUNT(*) FILTER (
+                WHERE open_access = true AND content_body IS NOT NULL AND content_body != ''
+                  AND doi IS NOT NULL AND oa_url IS NOT NULL
+            ) AS downloaded
         FROM crawled_items,
              LATERAL jsonb_array_elements_text(
                  COALESCE(domain_tags, '[]'::jsonb)
@@ -760,26 +814,95 @@ try:
     if not queue_rows:
         print(f"  {WARN}No Tier 1/2 queue data found.{RESET}")
     else:
-        print(f"  {BOLD}{'Track':<14} {'Awaiting OA-check':>18} {'Awaiting fulltext':>18}{RESET}")
-        print(f"  {'─'*14} {'─'*18} {'─'*18}")
+        cols = [
+            ("Total", 9), ("No DOI", 8), ("Awaiting OA-check", 18),
+            ("Not open access", 16), ("Awaiting fulltext", 18),
+            ("Skipped (error)", 16), ("Downloaded", 11),
+        ]
+        header = f"  {BOLD}{'Track':<14} " + " ".join(f"{name:>{w}}" for name, w in cols) + RESET
+        rule = f"  {'─'*14} " + " ".join('─'*w for _, w in cols)
+        print(header)
+        print(rule)
 
-        sum_oa_wait = sum_ft_wait = 0
-        for track, oa_wait, ft_wait in queue_rows:
-            print(f"  {track:<14} {oa_wait:>18,} {ft_wait:>18,}")
-            sum_oa_wait += oa_wait
-            sum_ft_wait += ft_wait
+        sums = [0] * len(cols)
+        for row in queue_rows:
+            track = row[0]
+            values = row[1:]
+            print(f"  {track:<14} " + " ".join(f"{v:>{w},}" for v, (_, w) in zip(values, cols)))
+            sums = [s + v for s, v in zip(sums, values)]
 
-        print(f"  {'─'*14} {'─'*18} {'─'*18}")
-        print(f"  {BOLD}{'TOTAL':<14} {sum_oa_wait:>18,} {sum_ft_wait:>18,}{RESET}")
+        print(rule)
+        print(f"  {BOLD}{'TOTAL':<14} " + " ".join(f"{v:>{w},}" for v, (_, w) in zip(sums, cols)) + RESET)
         print()
-        print(f"  {DIM}\"Awaiting OA-check\" = has a DOI, hasn't been asked to Unpaywall yet "
-              f"(runs in batches of 300 every 30 min).{RESET}")
+        print(f"  {DIM}Every column but \"Total\" is mutually exclusive — they always sum to "
+              f"it exactly. \"No DOI\" = never enters THIS pipeline — it does NOT mean no "
+              f"content: plenty of these were fetched directly by other crawl paths (RSS/"
+              f"sitemap/html_crawl/API sources with no DOI to check). \"Downloaded\" below is "
+              f"scoped ONLY to successes via this DOI→Unpaywall→fetch pipeline, so it "
+              f"undercounts real full-text articles — for the true total (any source), use "
+              f"\"FullTxt\" in the \"Crawled Full Articles by Track\" table above instead. "
+              f"\"Awaiting OA-check\" = has a DOI, hasn't been asked to Unpaywall yet (runs in "
+              f"batches of 3000 every 5 min). \"Not open access\" = Unpaywall was asked and confirmed "
+              f"no free copy exists — a final answer, not a retry candidate.{RESET}")
         print(f"  {DIM}\"Awaiting fulltext\" = Unpaywall already gave us a real download URL, "
-              f"but the actual fetch+extract hasn't happened yet (runs in batches of 300 "
-              f"every 30 min). This does NOT mean these will become real articles — most "
-              f"turn out paywalled/bot-blocked (mdpi.com, wiley, sagepub, sciencedirect, "
-              f"tandfonline, etc. routinely 403 us) and get marked as confirmed dead ends "
-              f"instead. This number just means \"gets a final answer next,\" not \"will succeed.\"{RESET}")
+              f"but the actual fetch+extract hasn't happened yet. This does NOT mean these "
+              f"will become real articles — most turn out paywalled/bot-blocked (mdpi.com, "
+              f"wiley, sagepub, sciencedirect, tandfonline, etc. routinely 403 us) and end up "
+              f"in \"Skipped (error)\" instead. This number just means \"gets a final answer "
+              f"next,\" not \"will succeed.\"{RESET}")
+        print(f"  {DIM}\"Skipped (error)\" = enrich_fulltext already gave up on these — a domain "
+              f"that never once succeeded, given up 24h after its first failure; a single URL "
+              f"given up after 3 failed attempts of its own; a manually-skipped dead domain "
+              f"({len(blocked_domains)} domain{'s' if len(blocked_domains) != 1 else ''} "
+              f"currently listed in config/surfaces.json — see the \"Manually skipped\" "
+              f"breakdown below); a paywall/low-quality page; or an unparseable PDF. Won't be "
+              f"retried unless the underlying block/skip is lifted. \"Downloaded\" = fetched "
+              f"and parsed successfully via THIS pipeline specifically — see the note under "
+              f"the table above before treating it as your full-text total.{RESET}")
+        print()
+
+    # ── Manually skipped, one row per configured domain ────────────────────
+    # The "Manually skipped" column above is grouped by track (domain_value
+    # from domain_tags), so a matched item with an empty domain_tags array
+    # (jsonb_array_elements_text on '[]' yields zero rows) or with
+    # authority_tier NOT IN (1, 2) never surfaces there at all — even though
+    # it genuinely matched a blocked_domain pattern. That silently hides
+    # some of the 8 configured domains from the table above. This section
+    # lists all of them — always exactly len(blocked_domains) rows,
+    # regardless of tags/tier — so nothing configured here goes invisible.
+    if blocked_domains:
+        cur.execute("""
+            SELECT
+                bd.domain,
+                COUNT(ci.id) AS total_matched,
+                COUNT(ci.id) FILTER (
+                    WHERE ci.authority_tier IN (1, 2)
+                      AND jsonb_array_length(COALESCE(ci.domain_tags, '[]'::jsonb)) > 0
+                ) AS counted_above
+            FROM unnest(%s::text[], %s::text[]) AS bd(domain, pattern)
+            LEFT JOIN crawled_items ci
+              ON ci.doi IS NOT NULL AND ci.oa_url IS NOT NULL
+              AND ci.oa_url LIKE bd.pattern
+            GROUP BY bd.domain
+            ORDER BY total_matched DESC, bd.domain;
+        """, (blocked_domains, blocked_patterns))
+        detail_rows = cur.fetchall()
+
+        print(f"  {BOLD}{'─'*70}{RESET}")
+        print(f"  {BOLD}{CYAN}Manually skipped — detail by domain ({len(blocked_domains)} configured){RESET}")
+        print(f"  {BOLD}{'─'*70}{RESET}")
+        print(f"  {BOLD}{'Domain':<42} {'Matched items':>14} {'Shown above':>12}{RESET}")
+        print(f"  {'─'*42} {'─'*14} {'─'*12}")
+        for domain, total_matched, counted_above in detail_rows:
+            hidden = total_matched - counted_above
+            flag = f" {WARN}(hidden — no domain_tags / tier≠1,2){RESET}" if hidden else ""
+            print(f"  {domain:<42} {total_matched:>14,} {counted_above:>12,}{flag}")
+        print()
+        print(f"  {DIM}\"Matched items\" = every crawled_items row (any tier, any/no domain_tags) "
+              f"whose oa_url matches this domain. \"Shown above\" = how many of those also had a "
+              f"non-empty domain_tags AND authority_tier in (1, 2), so they actually contribute "
+              f"to the \"Manually skipped\" column in the by-track table above. A domain with 0 "
+              f"matched items here simply has no crawled row with that oa_url yet.{RESET}")
         print()
 
     # ── WebSearch discovery queue (search repo's live-query fallback) ─────
@@ -903,7 +1026,7 @@ try:
         size = f.tell()
         f.seek(max(0, size - 800_000))  # scheduler/collector logging in between
         # the two enrichment lines can be verbose enough to push them apart by
-        # 300KB+ within a single ~30-min cycle — 800KB gives real headroom
+        # 300KB+ within a single enrichment cycle — 800KB gives real headroom
         tail = f.read().decode("utf-8", errors="replace")
 
     oa_matches = _re.findall(
@@ -920,7 +1043,7 @@ try:
     print(f"  {BOLD}{'─'*70}{RESET}")
     if ft_matches:
         ts, n = ft_matches[-1]
-        print(f"  Full articles downloaded (last ~30-min cycle): {GREEN}{int(n)}{RESET}  "
+        print(f"  Full articles downloaded (last cycle, every ~5 min): {GREEN}{int(n)}{RESET}  "
               f"{DIM}(logged at {ts}, server-local time — not UTC){RESET}")
     else:
         print(f"  {WARN}No enrich_fulltext cycle found in the last ~300KB of crawler.log.{RESET}")

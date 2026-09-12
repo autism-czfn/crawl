@@ -540,7 +540,7 @@ def _hash_content(content: str | None) -> str | None:
 # Unpaywall enrichment
 # ---------------------------------------------------------------------------
 
-async def enrich_unpaywall(session: AsyncSession, batch_size: int = 300) -> int:
+async def enrich_unpaywall(session: AsyncSession, batch_size: int = 3000) -> int:
     """Fetch open-access URLs from Unpaywall for records with DOI.
 
     Also backfills oa_url for existing open_access=True records that
@@ -555,6 +555,19 @@ async def enrich_unpaywall(session: AsyncSession, batch_size: int = 300) -> int:
     measured duration for batch_size=300 was already ~7-8 min even
     sequentially at the old 20rpm cap — this is meant to bring that
     down, not to push total throughput past what Unpaywall tolerates.
+
+    batch_size raised 300→3000 (2026-09-11): every request here goes to
+    ONE domain (api.unpaywall.org), which is gated by both the 60rpm
+    TokenBucket above AND its own asyncio.Semaphore(DEFAULT_CONCURRENCY=3)
+    in RateLimitedClient — so at most 3 requests are ever actually
+    in-flight regardless of batch_size, and total throughput stays capped
+    at the same safe 60rpm either way. A bigger batch just means fewer
+    5-min-interval cycles (enrich_fulltext_loop) spent doing nothing
+    between batches while a real backlog sits waiting — unlike raising
+    enrich_fulltext's batch_size, which fans out across MANY different
+    publisher domains at once and can exceed the shared global connection
+    pool (confirmed live 2026-09-10, see RateLimitedClient's `limits=`
+    comment) — that risk doesn't apply to this single-domain call.
     """
     import asyncio
     from src.config import settings
@@ -691,7 +704,21 @@ def _parse_html_body(html_text: str) -> str | None:
     return extract_body(BeautifulSoup(html_text, "html.parser"))
 
 
-_GIVE_UP_403_THRESHOLD = 5  # matches src/http/client.py's CircuitBreaker.threshold
+_DOMAIN_GIVE_UP_AFTER = timedelta(hours=24)  # see the domain give-up rule in enrich_fulltext()
+_URL_GIVE_UP_AFTER_ATTEMPTS = 3  # see the per-URL give-up rule in enrich_fulltext() stage 3
+
+# BUG FOUND 2026-09-11: a single stuck PDF/HTML parse in stage 2 (no timeout
+# anywhere on that path) blocks asyncio.gather() forever, which blocks the
+# one already-open DB transaction for the whole batch from ever reaching
+# commit(), which blocks enrich_fulltext_loop's single while-loop task from
+# ever starting its next cycle — the ENTIRE fulltext pipeline wedges
+# indefinitely until the process is restarted. Confirmed live: found a
+# connection sitting "idle in transaction" for 55+ min with the loop
+# stalled since its last "all N fetches done" log line, no further cycles
+# ever starting. This timeout is what stops that: a hung parse becomes a
+# normal per-URL failure (counts toward _URL_GIVE_UP_AFTER_ATTEMPTS above)
+# instead of wedging the whole service.
+_PARSE_TIMEOUT_SEC = 90
 
 
 def _domain_of(url: str) -> str:
@@ -704,14 +731,56 @@ def _domain_of(url: str) -> str:
 
 class _DomainGivenUp(Exception):
     """Raised by _fetch() instead of making a request, when the domain has
-    already crossed _GIVE_UP_403_THRESHOLD consecutive 403s across past
-    enrich_fulltext() cycles (see blocked_domains table / migration 0021).
-    Distinguished from a real fetch failure so stage 3 writes the ''
-    permanent-failure sentinel immediately instead of leaving NULL (which
-    would just retry — and re-fail — forever)."""
+    never once succeeded (ever_succeeded=False) and it has been
+    _DOMAIN_GIVE_UP_AFTER since its first-ever failure (see blocked_domains
+    table / migrations 0021, 0025). Distinguished from a real fetch failure
+    so stage 3 writes the '' permanent-failure sentinel immediately instead
+    of leaving NULL (which would just retry — and re-fail — forever)."""
 
 
-async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
+def _load_manually_skipped_domains() -> set[str]:
+    """Read config/surfaces.json for entries carrying a "blocked_domain"
+    field — a human-editable way to treat a domain as permanently given-up,
+    alongside the automatic blocked_domains table (see the domain give-up
+    rule in enrich_fulltext() above). Added 2026-09-11 for domains that fail
+    for a reason the automatic rule is slow to catch or shouldn't apply to
+    — e.g. DNS resolution failing outright, confirmed dead on two
+    independent resolvers — where retrying every cycle is pure waste.
+
+    These are NOT real crawl surfaces (enabled:0, platform is a
+    placeholder — see _COLLECTOR_MAP in src/scheduler.py, which never sees
+    them since _tick() only selects Surface.enabled == True rows) — the
+    "blocked_domain" field is what actually distinguishes one of these
+    entries from a normal surface config; everything else about it is
+    inert scheduler-wise. Piggybacking on config/surfaces.json rather than
+    a separate file was deliberate — one config file, not two.
+
+    Re-read from disk on every enrich_fulltext() call (it's a small file)
+    rather than cached, so editing it — un-skipping a domain once you've
+    manually re-checked it, or adding a new one — takes effect on the very
+    next cycle (currently every 5 min) with no crawler restart needed.
+
+    Missing file or bad JSON is treated as "nothing manually skipped", not
+    an error — this mechanism is optional, additive to the 403-based one.
+    """
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).parent.parent / "config" / "surfaces.json"
+    if not path.exists():
+        return set()
+    try:
+        surfaces = json.loads(path.read_text())
+    except Exception as exc:
+        logger.warning("surfaces.json: failed to parse while checking for blocked_domain entries: %s", exc)
+        return set()
+    return {
+        s["blocked_domain"] for s in surfaces
+        if isinstance(s, dict) and s.get("blocked_domain")
+    }
+
+
+async def enrich_fulltext(session: AsyncSession, batch_size: int = 500) -> int:
     """Fetch full text for open-access records that have an oa_url.
 
     Three stages, run across the whole batch instead of one row at a time:
@@ -726,10 +795,14 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
          tail end.
       3. WRITE — a single sequential pass over the results, applying the
          same permanent-failure-sentinel rules as before (store '' for a
-         definitive rejection so it's never re-fetched; leave NULL on a
-         transient fetch error so it's retried next cycle). AsyncSession
-         isn't safe for concurrent use, so this stage is intentionally
-         sequential even though 1 and 2 are not.
+         definitive rejection so it's never re-fetched), plus two give-up
+         rules added in migration 0025: a domain that has NEVER succeeded
+         is given up on wholesale 24h after its first failure, and any
+         single URL (on a domain that HAS succeeded before, so isn't
+         blacklisted wholesale) is given up on after 3 failed attempts of
+         its own. Anything below those thresholds is left NULL, retried
+         next cycle. AsyncSession isn't safe for concurrent use, so this
+         stage is intentionally sequential even though 1 and 2 are not.
 
     See crawl.txt section 14 for the full design writeup.
     """
@@ -746,6 +819,9 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
             select(BlockedDomain.domain).where(BlockedDomain.given_up.is_(True))
         )).scalars().all()
     )
+    manually_skipped = _load_manually_skipped_domains()
+    if manually_skipped:
+        given_up_domains |= manually_skipped
 
     _priority = case(
         (cast(CrawledItem.domain_tags, String).ilike("%sleep%"), 0),
@@ -753,7 +829,7 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
         else_=1,
     )
     result = await session.execute(
-        select(CrawledItem.id, CrawledItem.oa_url)
+        select(CrawledItem.id, CrawledItem.oa_url, CrawledItem.fetch_attempts)
         .where(CrawledItem.open_access.is_(True))
         .where(CrawledItem.content_body.is_(None))
         .where(CrawledItem.doi.isnot(None))
@@ -761,9 +837,11 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
         .order_by(_priority, desc(CrawledItem.collected_at))
         .limit(batch_size)
     )
-    rows = result.fetchall()
-    if not rows:
+    rows_with_attempts = result.fetchall()
+    if not rows_with_attempts:
         return 0
+    rows = [(rid, url) for rid, url, _attempts in rows_with_attempts]
+    attempts_by_id = {rid: attempts for rid, _url, attempts in rows_with_attempts}
 
     # Instrumentation added 2026-08-27: the only prior visibility into this
     # function was one summary line ("enriched N records") logged AFTER the
@@ -818,51 +896,79 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
         len(rows), _time.monotonic() - batch_start,
     )
 
-    # ── Track consecutive 403s per domain, across this batch AND prior
-    #    cycles (the counter is persisted in blocked_domains) ──────────────
-    # A domain that already got 5+ 403s in a row here has almost certainly
-    # got an active anti-bot WAF (Cloudflare/Akamai/etc — confirmed durable
-    # even against a real browser for a comparable domain, see chop_adhd's
-    # content_notes) rather than a transient blip, so give up on it for good
-    # instead of re-attempting it, and everything on it, every cycle forever.
+    # ── Track per-domain success/failure, across this batch AND prior
+    #    cycles (persisted in blocked_domains) — decides domain give-up ────
+    # Migration 0025 rule (replaces the old 403-count-only threshold):
+    #   - A domain that has NEVER succeeded (ever_succeeded=False, durable
+    #     across cycles) and has now gone >=24h since its first-ever
+    #     failure with still zero successes is given up on WHOLESALE —
+    #     everything on it written as '' immediately instead of fetched,
+    #     every future cycle.
+    #   - A domain that HAS succeeded before is never given up on
+    #     wholesale, no matter how many other URLs on it fail — its bad
+    #     URLs self-eliminate individually instead, via the
+    #     fetch_attempts >= 3 rule in stage 3 below.
     # Attribute by the FINAL url (after any redirects), not the requested
     # oa_url — many oa_urls are doi.org resolver links that redirect to the
-    # actual publisher; blaming doi.org for a 403 that really came from
-    # whatever it redirected to would give up on the shared front door for
-    # EVERY publisher's DOIs, including ones that were never blocking us at
-    # all. src/http/client.py attaches final_url to the exception for this.
-    domain_403_count: dict[str, int] = {}
+    # actual publisher; blaming doi.org for a failure that really came from
+    # whatever it redirected to would wrongly implicate the shared front
+    # door for EVERY publisher's DOIs, including ones that were never
+    # blocking us at all. src/http/client.py attaches final_url to the
+    # exception for this.
+    domain_failed: set[str] = set()
     domain_succeeded: set[str] = set()
     for row_id, oa_url, resp, fetch_exc in fetched:
-        if isinstance(fetch_exc, PermissionError) and "403" in str(fetch_exc):
-            domain = _domain_of(getattr(fetch_exc, "final_url", None) or oa_url)
-            domain_403_count[domain] = domain_403_count.get(domain, 0) + 1
-        elif resp is not None:
-            domain_succeeded.add(_domain_of(str(resp.url)))
+        if resp is not None:
+            domain = _domain_of(str(resp.url))
+            (domain_succeeded if resp.status_code < 400 else domain_failed).add(domain)
+        elif fetch_exc is not None:
+            domain_failed.add(_domain_of(getattr(fetch_exc, "final_url", None) or oa_url))
 
     newly_given_up: set[str] = set()
-    for domain in set(domain_403_count) | domain_succeeded:
-        if domain in domain_succeeded:
-            new_count = 0
+    now = datetime.now(tz=timezone.utc)
+    for domain in domain_failed | domain_succeeded:
+        existing = (await session.execute(
+            select(BlockedDomain.ever_succeeded, BlockedDomain.first_failure_at,
+                   BlockedDomain.consecutive_403_count)
+            .where(BlockedDomain.domain == domain)
+        )).one_or_none()
+        prev_ever_succeeded, prev_first_failure_at, prev_403_count = existing or (False, None, 0)
+
+        succeeded_now = domain in domain_succeeded
+        ever_succeeded = prev_ever_succeeded or succeeded_now
+        # consecutive_403_count is kept only as an informational counter now
+        # (given_up is no longer decided from it) — still bumped for
+        # visibility in setup.sh / manual debugging.
+        new_403_count = 0 if succeeded_now else prev_403_count + sum(
+            1 for _rid, url, _resp, exc in fetched
+            if isinstance(exc, PermissionError) and "403" in str(exc)
+            and _domain_of(getattr(exc, "final_url", None) or url) == domain
+        )
+
+        if ever_succeeded:
+            first_failure_at = None
+            will_give_up = False
         else:
-            existing = (await session.execute(
-                select(BlockedDomain.consecutive_403_count).where(BlockedDomain.domain == domain)
-            )).scalar_one_or_none() or 0
-            new_count = existing + domain_403_count.get(domain, 0)
-        will_give_up = new_count >= _GIVE_UP_403_THRESHOLD
+            first_failure_at = prev_first_failure_at or now
+            will_give_up = (now - first_failure_at) >= _DOMAIN_GIVE_UP_AFTER
+
         stmt = insert(BlockedDomain).values(
             domain=domain,
-            consecutive_403_count=new_count,
+            consecutive_403_count=new_403_count,
             given_up=will_give_up,
-            given_up_at=datetime.now(tz=timezone.utc) if will_give_up else None,
-            last_checked_at=datetime.now(tz=timezone.utc),
+            given_up_at=now if will_give_up else None,
+            last_checked_at=now,
+            ever_succeeded=ever_succeeded,
+            first_failure_at=first_failure_at,
         ).on_conflict_do_update(
             index_elements=["domain"],
             set_={
-                "consecutive_403_count": new_count,
+                "consecutive_403_count": new_403_count,
                 "given_up": will_give_up,
-                "given_up_at": datetime.now(tz=timezone.utc) if will_give_up else None,
-                "last_checked_at": datetime.now(tz=timezone.utc),
+                "given_up_at": now if will_give_up else None,
+                "last_checked_at": now,
+                "ever_succeeded": ever_succeeded,
+                "first_failure_at": first_failure_at,
             },
         )
         await session.execute(stmt)
@@ -870,8 +976,8 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
             newly_given_up.add(domain)
     if newly_given_up:
         logger.warning(
-            "enrich_fulltext: giving up on domain(s) after %d+ consecutive 403s: %s",
-            _GIVE_UP_403_THRESHOLD, sorted(newly_given_up),
+            "enrich_fulltext: giving up on domain(s) after 24h with zero successes: %s",
+            sorted(newly_given_up),
         )
 
     # ── Stage 2: concurrent parse — PDFs on the process pool, HTML on threads ──
@@ -891,9 +997,19 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
             parse_futures.append(asyncio.to_thread(_parse_html_body, resp.text))
 
     # Gather only the real futures, preserving position via a placeholder pass.
+    # Each one individually timeout-bounded (see _PARSE_TIMEOUT_SEC above) —
+    # gather(return_exceptions=True) alone only protects against a future
+    # that RAISES, not one that just never finishes.
+    async def _parse_with_timeout(fut):
+        try:
+            return await asyncio.wait_for(fut, timeout=_PARSE_TIMEOUT_SEC)
+        except Exception as exc:  # includes asyncio.TimeoutError
+            return exc
+
     real_futures = [f for f in parse_futures if f is not None]
     real_results = iter(
-        await asyncio.gather(*real_futures, return_exceptions=True) if real_futures else []
+        await asyncio.gather(*(_parse_with_timeout(f) for f in real_futures))
+        if real_futures else []
     )
     parsed = [None if f is None else next(real_results) for f in parse_futures]
 
@@ -913,8 +1029,8 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
         failed-transaction state for the rest of the loop AND prevent the
         final commit() from ever running — the exact same failure mode
         already seen in the clinicaltrials_* surfaces (see earlier fix).
-        batch_size=300 makes hitting this kind of row far more likely per
-        cycle than it used to be at 100.
+        batch_size=500 (300 before 2026-09-10) makes hitting this kind of
+        row far more likely per cycle than it used to be at 100.
         """
         try:
             async with session.begin_nested():
@@ -923,6 +1039,33 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
                 )
         except Exception as exc:
             logger.warning("enrich_fulltext: write failed for row %s, skipping just this row: %s", row_id, exc)
+
+    async def _note_failed_attempt(row_id, oa_url):
+        """One URL-level failure (any type) not already covered by a
+        domain-wide give-up above. At _URL_GIVE_UP_AFTER_ATTEMPTS, give up
+        on this URL specifically (content_body='' — same permanent-failure
+        sentinel as a domain give-up), regardless of its domain's status —
+        this is what actually retires individual dead URLs on a domain
+        that HAS succeeded before and so is never blacklisted wholesale
+        (migration 0025). Below the threshold, just bump fetch_attempts
+        (content_body stays NULL — still retried next cycle), isolated in
+        its own SAVEPOINT same as _write() above.
+        """
+        new_attempts = attempts_by_id.get(row_id, 0) + 1
+        if new_attempts >= _URL_GIVE_UP_AFTER_ATTEMPTS:
+            await _write(row_id, "")
+            logger.info(
+                "enrich_fulltext: giving up on URL after %d failed attempts: %s",
+                new_attempts, oa_url,
+            )
+            return
+        try:
+            async with session.begin_nested():
+                await session.execute(
+                    update(CrawledItem).where(CrawledItem.id == row_id).values(fetch_attempts=new_attempts)
+                )
+        except Exception as exc:
+            logger.warning("enrich_fulltext: attempt-count write failed for row %s: %s", row_id, exc)
 
     def _sanitize(text: str | None) -> str | None:
         """Strip NUL bytes — Postgres UTF8 text columns reject them outright
@@ -964,13 +1107,15 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
                 await _write(row_id, "")
                 continue
             logger.debug("enrich_fulltext: fetch failed for %s: %s", oa_url, fetch_exc)
-            continue  # transient — leave NULL, retry next cycle
+            await _note_failed_attempt(row_id, oa_url)
+            continue  # retried next cycle, unless _note_failed_attempt just gave up on it
 
         is_pdf = "application/pdf" in resp.headers.get("content-type", "")
 
         if isinstance(parse_result, Exception):
             logger.debug("enrich_fulltext: parse raised for %s: %s", oa_url, parse_result)
-            continue  # transient/unexpected — leave NULL, retry next cycle
+            await _note_failed_attempt(row_id, oa_url)
+            continue  # retried next cycle, unless _note_failed_attempt just gave up on it
 
         if is_pdf:
             extracted = _sanitize(parse_result)
@@ -1013,7 +1158,9 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 300) -> int:
 
 
 async def enrich_fulltext_loop() -> None:
-    """Long-running loop: enriches academic records with full text every 6 hours.
+    """Long-running loop: enriches academic records with full text, cycling
+    every _interval seconds between runs (see that constant below for the
+    current value and the reasoning behind it).
 
     Step 1 — enrich_unpaywall: for every item with a DOI, fetch its open-access
               URL from Unpaywall and store it in oa_url.
@@ -1024,10 +1171,17 @@ async def enrich_fulltext_loop() -> None:
     Unpaywall has populated oa_url.
     """
     import asyncio as _asyncio
-    _interval = 30 * 60  # was 6h — Unpaywall/fetch throughput is bounded by the
-    # per-domain semaphore (=3) in src/http/client.py, not by this loop's own
-    # pacing, and downstream (chunking/embedding) has ample headroom — so cycle
-    # much more often to burn down the backlog faster.
+    _interval = 5 * 60  # was 30 min (originally 6h) — a 500-item batch now
+    # finishes in ~90s (connection-pool + connect-timeout fixes, 2026-09-10),
+    # so 30 min of sleep after that was mostly idle time against a real
+    # backlog. Deliberately NOT shortened to "a few seconds": enrich_fulltext
+    # always selects the newest still-unfetched items, so a much shorter gap
+    # would mostly just re-hit the same currently-failing domains rather than
+    # let new items accumulate, and turns "bursty with rest periods" traffic
+    # into sustained load — which sites already reacted worse to (doi.org)
+    # than to isolated requests. 5 min is a middle ground: meaningfully more
+    # throughput than 30 min, without hammering the same stuck items or
+    # looking like sustained abuse to any one domain.
     logger.info("enrich_fulltext loop started (interval=%ds)", _interval)
     while True:
         try:

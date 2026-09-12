@@ -24,7 +24,16 @@ logger = logging.getLogger(__name__)
 # Regex patterns for academic URL/ID detection in plain text
 _PATTERNS = [
     # DOI: doi.org/10.xxxx/...
-    ("doi", re.compile(r"doi\.org/(10\.[^\s\)\"\>\]]+)")),
+    # ')' is deliberately NOT excluded here (unlike the other terminators) —
+    # some real DOIs legitimately contain a balanced parenthesis pair (e.g.
+    # ASHA-journal style "10.1044/1058-0360(2012/10-0078)"). Excluding it
+    # truncated those one character early into a permanently-unresolvable
+    # ID (confirmed live 2026-09-11: "10.1352/1934-9556(2008",
+    # "10.1044/1058-0360(2012/10-0078" showing up 404 against Unpaywall —
+    # the real, resolvable DOI has the closing ')'). _trim_unbalanced_paren()
+    # below distinguishes a DOI's own closing ')' from one belonging to
+    # surrounding prose (e.g. "(see doi.org/10.1038/xyz)").
+    ("doi", re.compile(r"doi\.org/(10\.[^\s\"\>\]]+)")),
     # PubMed: pubmed.ncbi.nlm.nih.gov/DIGITS
     ("pmid", re.compile(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d{4,})")),
     # arXiv: arxiv.org/abs/ID
@@ -94,6 +103,29 @@ async def collect(
     return all_stubs, next_cursor
 
 
+def _trim_unbalanced_paren(raw: str) -> str:
+    """Truncate a DOI candidate at the first ')' that has no matching
+    earlier '(' within this same string.
+
+    The DOI regex now allows ')' through (see _PATTERNS) so it stops
+    truncating DOIs that legitimately contain a balanced parenthesis pair.
+    But a DOI embedded in a sentence is often itself wrapped in parens by
+    the surrounding prose (e.g. "(see doi.org/10.1038/xyz)"), where that
+    trailing ')' is NOT part of the DOI. Tracking paren depth tells the
+    two cases apart: a ')' that closes a '(' earlier in THIS string is
+    part of the DOI; one with no such match belongs to the sentence.
+    """
+    depth = 0
+    for i, ch in enumerate(raw):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                return raw[:i]
+            depth -= 1
+    return raw
+
+
 def _extract_paper_stubs(text: str) -> list[CollectedItem]:
     """Extract CollectedItem stubs from plain text."""
     stubs: list[CollectedItem] = []
@@ -101,20 +133,28 @@ def _extract_paper_stubs(text: str) -> list[CollectedItem]:
 
     for id_type, pattern in _PATTERNS:
         for match in pattern.finditer(text):
-            raw_id = match.group(1).rstrip(".,;:)")
             if id_type == "doi":
+                # Paren-balance first (see _trim_unbalanced_paren), and
+                # leave ')' out of the punctuation strip below — a
+                # legitimately-balanced trailing ')' must survive it
+                # (unlike the other id types below, which have no such case
+                # and keep the plain rstrip(".,;:)" )).
+                raw_id = _trim_unbalanced_paren(match.group(1)).rstrip(".,;:")
                 canonical_url = f"https://doi.org/{raw_id}"
                 title_placeholder = raw_id
                 stub_id = f"doi:{raw_id}"
             elif id_type == "pmid":
+                raw_id = match.group(1).rstrip(".,;:)")
                 canonical_url = f"https://pubmed.ncbi.nlm.nih.gov/{raw_id}/"
                 title_placeholder = f"PMID:{raw_id}"
                 stub_id = f"pmid:{raw_id}"
             elif id_type == "arxiv":
+                raw_id = match.group(1).rstrip(".,;:)")
                 canonical_url = f"https://arxiv.org/abs/{raw_id}"
                 title_placeholder = f"arXiv:{raw_id}"
                 stub_id = f"arxiv:{raw_id}"
             elif id_type == "pmc":
+                raw_id = match.group(1).rstrip(".,;:)")
                 canonical_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{raw_id}/"
                 title_placeholder = f"PMC{raw_id}"
                 stub_id = f"pmc:{raw_id}"
