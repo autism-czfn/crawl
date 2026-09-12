@@ -22,8 +22,10 @@ cd "$(dirname "$0")"
 PROJECT_DIR="$(pwd)"
 PID_FILE="$PROJECT_DIR/.crawler.pid"
 ADMIN_PID_FILE="$PROJECT_DIR/.admin.pid"
-LOG_FILE="$PROJECT_DIR/crawler.log"
-ADMIN_LOG_FILE="$PROJECT_DIR/admin.log"
+LOG_DIR="$PROJECT_DIR/logs"
+LOG_FILE="$LOG_DIR/crawler.log"
+ADMIN_LOG_FILE="$LOG_DIR/admin.log"
+mkdir -p "$LOG_DIR"
 ADMIN_PORT="${ADMIN_PORT:-8001}"
 PYTHON="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}"
 PYTHON="${PYTHON:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null)}"
@@ -965,14 +967,14 @@ except Exception as e:
     print(f"  {WARN}[WARN]{RESET}  DB query failed: {e}")
     traceback.print_exc()
 
-# ── Last enrichment cycle (from crawler.log, not the DB) ──────────────────
+# ── Last enrichment cycle (from logs/crawler.log, not the DB) ─────────────
 # enrich_fulltext_loop runs every 30 min and logs its own result EVERY time
 # now (including 0 — see src/pipeline.py), so the last matching line is
 # always the true most-recent cycle, never a stale nonzero one from
 # several cycles back.
 import re as _re
 try:
-    log_path = pathlib.Path("crawler.log")
+    log_path = pathlib.Path("logs/crawler.log")
     with open(log_path, "rb") as f:
         f.seek(0, 2)
         size = f.tell()
@@ -991,23 +993,23 @@ try:
     )
 
     print(f"  {BOLD}{'─'*70}{RESET}")
-    print(f"  {BOLD}{CYAN}Last enrichment cycle (from crawler.log){RESET}")
+    print(f"  {BOLD}{CYAN}Last enrichment cycle (from logs/crawler.log){RESET}")
     print(f"  {BOLD}{'─'*70}{RESET}")
     if ft_matches:
         ts, n = ft_matches[-1]
         print(f"  Full articles downloaded (last cycle, every ~5 min): {GREEN}{int(n)}{RESET}  "
               f"{DIM}(logged at {ts}, server-local time — not UTC){RESET}")
     else:
-        print(f"  {WARN}No enrich_fulltext cycle found in the last ~300KB of crawler.log.{RESET}")
+        print(f"  {WARN}No enrich_fulltext cycle found in the last ~300KB of logs/crawler.log.{RESET}")
     if oa_matches:
         ts, n = oa_matches[-1]
         print(f"  OA-status checks resolved (same cycle):        {int(n)}  "
               f"{DIM}(logged at {ts}, server-local time — not UTC){RESET}")
     print()
 except FileNotFoundError:
-    print(f"  {WARN}crawler.log not found — can't report the last enrichment cycle.{RESET}")
+    print(f"  {WARN}logs/crawler.log not found — can't report the last enrichment cycle.{RESET}")
 except Exception as e:
-    print(f"  {WARN}[WARN]{RESET}  Reading crawler.log failed: {e}")
+    print(f"  {WARN}[WARN]{RESET}  Reading logs/crawler.log failed: {e}")
 PYEOF
 }
 

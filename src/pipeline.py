@@ -571,6 +571,7 @@ async def enrich_unpaywall(session: AsyncSession, batch_size: int = 3000) -> int
     """
     import asyncio
     from src.config import settings
+    from src.health import heartbeat
     from src.http.client import get_shared_client
 
     client = get_shared_client()
@@ -609,7 +610,24 @@ async def enrich_unpaywall(session: AsyncSession, batch_size: int = 3000) -> int
         except Exception as exc:
             return (row_id, None, exc)
 
-    results = await asyncio.gather(*(_check(rid, doi) for rid, doi in rows))
+    # A full batch_size=3000 backlog at the ~60rpm/3-concurrent cap this is
+    # actually limited to (see docstring above) can take 15-50+ minutes.
+    # gather() gave no visibility into that — nothing logged and no
+    # heartbeat("enrich_fulltext") fired until every one of the 3000 calls
+    # had returned, which is exactly what starved the loop's heartbeat past
+    # its 900s stale threshold and tripped a false "not_ready" health check
+    # for the ~16 min this step alone took (confirmed via logs/crawler.log,
+    # INC-20260912-0003: no enrich_unpaywall/enrich_fulltext completion line
+    # between 16:37:06, the last restart, and 16:53:26). as_completed lets
+    # us log progress and heartbeat every 100 results instead of only after
+    # the whole batch finishes.
+    logger.info("enrich_unpaywall: checking %d DOIs (may take a while at ~60rpm)", len(rows))
+    results = []
+    for i, coro in enumerate(asyncio.as_completed([_check(rid, doi) for rid, doi in rows]), start=1):
+        results.append(await coro)
+        if i % 100 == 0 or i == len(rows):
+            logger.info("enrich_unpaywall: progress %d/%d DOIs checked", i, len(rows))
+            heartbeat("enrich_fulltext")
 
     # Sequential writes (AsyncSession isn't safe for concurrent use), each in
     # its own SAVEPOINT so one malformed response can't poison the rest of
@@ -807,6 +825,7 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 500) -> int:
     See crawl.txt section 14 for the full design writeup.
     """
     import asyncio
+    from src.health import heartbeat
     from src.http.client import get_shared_client
     from src.extractors.pdf import extract_text_from_pdf
     from src.storage.models import BlockedDomain
@@ -889,6 +908,16 @@ async def enrich_fulltext(session: AsyncSession, batch_size: int = 500) -> int:
                     _progress["done"], len(rows), elapsed,
                     _progress["success"], _progress["given_up_skip"], _progress["failed"],
                 )
+                # Same reasoning as enrich_unpaywall's as_completed switch
+                # (INC-20260912-0003): this stage runs inside the same
+                # heartbeat("enrich_fulltext") loop and can itself take long
+                # enough — a batch spanning many slow/blocking domains — to
+                # starve the 900s stale threshold on its own. gather()
+                # already runs _fetch concurrently, so this finally block
+                # fires per-completion, not just at the end; piggyback the
+                # heartbeat on the same 25-item cadence instead of adding a
+                # separate timer.
+                heartbeat("enrich_fulltext")
 
     fetched = await asyncio.gather(*(_fetch(rid, url) for rid, url in rows))
     logger.info(
@@ -1193,6 +1222,7 @@ async def enrich_no_doi_urls(session: AsyncSession, batch_size: int = 300) -> in
     """
     import asyncio
     from src.collectors.fulltext import fetch_html_and_extract, fetch_pdf_url
+    from src.health import heartbeat
     from src.http.client import get_shared_client
 
     client = get_shared_client()
@@ -1227,7 +1257,23 @@ async def enrich_no_doi_urls(session: AsyncSession, batch_size: int = 300) -> in
         except Exception as exc:
             return row_id, None, exc
 
-    results = await asyncio.gather(*(_fetch_one(rid, url) for rid, url, _ in rows_with_attempts))
+    # Same as_completed treatment as enrich_unpaywall (INC-20260912-0003):
+    # this stage alone can run long when several domains are blocking/
+    # circuit-breaker-OPEN, and it shares enrich_fulltext_loop's single
+    # heartbeat("enrich_fulltext") call at the end of the whole cycle — a
+    # blind gather() here gave it the exact same starve-the-heartbeat
+    # exposure step 1 had, just with a smaller batch_size (300 vs 3000)
+    # making it less likely, not impossible.
+    logger.info("enrich_no_doi_urls: checking %d URLs", len(rows_with_attempts))
+    results = []
+    for i, coro in enumerate(
+        asyncio.as_completed([_fetch_one(rid, url) for rid, url, _ in rows_with_attempts]),
+        start=1,
+    ):
+        results.append(await coro)
+        if i % 50 == 0 or i == len(rows_with_attempts):
+            logger.info("enrich_no_doi_urls: progress %d/%d URLs checked", i, len(rows_with_attempts))
+            heartbeat("enrich_fulltext")
 
     async def _write(row_id, content_body_value):
         try:

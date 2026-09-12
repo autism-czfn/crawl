@@ -18,6 +18,7 @@ down).
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Dict
@@ -28,7 +29,17 @@ from sqlalchemy import text
 
 from src.storage.db import engine
 
+logger = logging.getLogger(__name__)
+
 _HEARTBEATS: Dict[str, "LoopHeartbeat"] = {}
+
+# Set to the time.time() a not-ready result first appeared, so the next ok
+# result can log how long the outage actually lasted; None while healthy.
+# Otherwise an incident like INC-20260912-0003 (503 for ~2 min, self-resolved)
+# leaves zero trace in our own log — the only record is the external
+# monitor's alert, and answering "why" means guessing from unrelated lines
+# around the alert's timestamp instead of reading what actually tripped it.
+_unhealthy_since: float | None = None
 
 
 @dataclass
@@ -67,6 +78,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     async def health():
+        global _unhealthy_since
         now = time.time()
         db_ok, db_detail = await _db_ok()
         ages = {name: round(now - hb.last_at, 1) for name, hb in _HEARTBEATS.items()}
@@ -74,6 +86,22 @@ def create_app() -> FastAPI:
         ok = db_ok and not stuck
         body = {"status": "ok" if ok else "not_ready", "db": db_detail,
                 "loops_age_seconds": ages, "stuck_loops": stuck}
+
+        if not ok:
+            if _unhealthy_since is None:
+                _unhealthy_since = now
+            logger.warning(
+                "health check not_ready: db_ok=%s db=%s stuck_loops=%s",
+                db_ok, db_detail, stuck,
+            )
+        elif _unhealthy_since is not None:
+            logger.warning(
+                "health check recovered after %.0fs (was not_ready since %s)",
+                now - _unhealthy_since,
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_unhealthy_since)),
+            )
+            _unhealthy_since = None
+
         return JSONResponse(status_code=200 if ok else 503, content=body)
 
     return app
