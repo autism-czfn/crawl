@@ -5,6 +5,7 @@ storing and sending HTTP conditional request headers.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from email.utils import parsedate_to_datetime
@@ -181,7 +182,13 @@ async def collect(
             art_resp = await client.get(url, use_browser_ua=True)
             from bs4 import BeautifulSoup
             art_soup = BeautifulSoup(art_resp.text, "html.parser")
-            body = extract_body(art_soup)
+            # trafilatura/BeautifulSoup parsing is CPU-bound and was blocking
+            # the shared asyncio event loop for its full duration — including
+            # the health-check server's ability to accept a connection
+            # (confirmed live 2026-09-12: /api/health went fully UNREACHABLE,
+            # not just slow, while this ran). Offload to a thread so the loop
+            # stays free to service everything else while this runs.
+            body = await asyncio.to_thread(extract_body, art_soup)
             if body:
                 item["content_body"] = body
                 fetched += 1

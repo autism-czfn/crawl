@@ -13,6 +13,7 @@ Strategies by source:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import xml.etree.ElementTree as ET
 
@@ -115,7 +116,7 @@ async def fetch_pmc_fulltext(client, pmcid: str) -> str | None:
     html_url = f"https://pmc.ncbi.nlm.nih.gov/articles/PMC{numeric_id}/"
     html = await _fetch_bytes(client, html_url)
     if html:
-        text = _extract_html_text(html)
+        text = await asyncio.to_thread(_extract_html_text, html)
         if text:
             logger.debug("PMC full text via HTML for PMC%s (%d chars)", numeric_id, len(text))
             return text
@@ -128,7 +129,7 @@ async def fetch_pmc_fulltext(client, pmcid: str) -> str | None:
     xml_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?{params}"
     xml_bytes = await _fetch_bytes(client, xml_url)
     if xml_bytes:
-        text = _extract_xml_text(xml_bytes)
+        text = await asyncio.to_thread(_extract_xml_text, xml_bytes)
         if text:
             logger.debug("PMC full text via efetch XML for PMC%s (%d chars)", numeric_id, len(text))
             return text
@@ -147,7 +148,7 @@ async def fetch_europepmc_fulltext(client, source: str, paper_id: str) -> str | 
     xml_bytes = await _fetch_bytes(client, xml_url)
     if not xml_bytes:
         return None
-    text = _extract_xml_text(xml_bytes)
+    text = await asyncio.to_thread(_extract_xml_text, xml_bytes)
     if text:
         logger.debug("EuropePMC full text for %s/%s (%d chars)", source, paper_id, len(text))
     return text
@@ -158,7 +159,7 @@ async def fetch_html_and_extract(client, url: str) -> str | None:
     html = await _fetch_bytes(client, url)
     if not html:
         return None
-    text = _extract_html_text(html)
+    text = await asyncio.to_thread(_extract_html_text, html)
     if text:
         logger.debug("HTML full text from %s (%d chars)", url, len(text))
     return text
@@ -174,7 +175,7 @@ async def fetch_pdf_url(client, pdf_url: str) -> str | None:
     pdf_bytes = await _fetch_bytes(client, pdf_url)
     if not pdf_bytes:
         return None
-    text = _extract_pdf_text(pdf_bytes)
+    text = await asyncio.to_thread(_extract_pdf_text, pdf_bytes)
     if text:
         logger.debug("PDF extracted from %s (%d chars)", pdf_url, len(text))
     return text
@@ -192,7 +193,7 @@ async def fetch_biorxiv_fulltext(client, doi: str, server: str = "biorxiv") -> s
     html_url = f"https://www.{base_domain}.org/content/{doi}"
     html = await _fetch_bytes(client, html_url)
     if html:
-        text = _extract_html_text(html)
+        text = await asyncio.to_thread(_extract_html_text, html)
         if text:
             logger.debug("bioRxiv HTML full text for %s (%d chars)", doi, len(text))
             return text

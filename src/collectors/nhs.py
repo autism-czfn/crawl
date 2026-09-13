@@ -123,7 +123,13 @@ async def collect(
             continue
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        item = _extract_page(soup, url)
+        # _extract_page's trafilatura call is CPU-bound and was blocking the
+        # shared asyncio event loop for its full duration — including the
+        # health-check server's ability to accept a connection (confirmed
+        # live 2026-09-12: /api/health went fully UNREACHABLE, not just
+        # slow, while this ran). Offload to a thread, same pattern as
+        # pipeline.py's _parse_html_body.
+        item = await asyncio.to_thread(_extract_page, soup, url)
         if item:
             items.append(item)
             new_cursor = url

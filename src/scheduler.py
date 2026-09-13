@@ -168,7 +168,27 @@ class Scheduler:
                     ))
 
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Heartbeat as each due surface finishes, not only once after the
+            # WHOLE concurrent batch. register("scheduler", 60s) only gives a
+            # 180s stale budget, and this used to heartbeat once per full
+            # tick, after every concurrently-running surface had finished —
+            # one slow surface (a flaky domain retrying through SSL hiccups,
+            # a slow Playwright render, a big link_harvester_backfill batch)
+            # could starve that single heartbeat past 180s and falsely flag
+            # "scheduler" as stuck even though every other surface finished
+            # fine (same false-alarm shape as enrich_fulltext's
+            # INC-20260912-0003). Per-completion heartbeats bound the gap to
+            # whichever surface is slowest, not the combination of all of
+            # them. return_exceptions=True's job — one broken surface can't
+            # kill the tick — is preserved by the try/except below, since
+            # as_completed() re-raises a task's exception when awaited.
+            from src.health import heartbeat
+            for coro in asyncio.as_completed(tasks):
+                try:
+                    await coro
+                except Exception as exc:
+                    logger.error("scheduler: a surface task failed unexpectedly: %s", exc, exc_info=True)
+                heartbeat("scheduler")
 
     async def _run_surface_throttled(self, surface_key: str) -> None:
         """Wrapper that acquires the playwright semaphore before running."""

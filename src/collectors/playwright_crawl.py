@@ -134,7 +134,13 @@ async def collect(
             domain = urlparse(start_url).netloc.lstrip("www.")
 
             # Extract item from start page itself
-            item = _extract_item(soup, start_url, domain)
+            # _extract_item's trafilatura call is CPU-bound and was blocking
+            # the shared asyncio event loop for its full duration — including
+            # the health-check server's ability to accept a connection
+            # (confirmed live 2026-09-12: /api/health went fully UNREACHABLE,
+            # not just slow, while this ran). Offload to a thread, same
+            # pattern as pipeline.py's _parse_html_body.
+            item = await asyncio.to_thread(_extract_item, soup, start_url, domain)
             if item:
                 items.append(item)
                 new_cursor = start_url
@@ -162,7 +168,7 @@ async def collect(
                     continue
 
                 page_soup = BeautifulSoup(page_html, "html.parser")
-                item = _extract_item(page_soup, url, domain)
+                item = await asyncio.to_thread(_extract_item, page_soup, url, domain)
                 if item:
                     items.append(item)
 
