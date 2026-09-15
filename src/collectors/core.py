@@ -63,9 +63,10 @@ async def collect(
             continue
 
         doi = normalize_doi(r.get("doi"))
+        source_urls = r.get("sourceFulltextUrls") or []
         url = (
             r.get("downloadUrl")
-            or r.get("sourceFulltextUrls", [None])[0]
+            or (source_urls[0] if source_urls else None)
             or (f"https://doi.org/{doi}" if doi else "")
             or f"https://core.ac.uk/works/{r.get('id', '')}"
         )

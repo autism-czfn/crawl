@@ -155,7 +155,19 @@ async def collect(
         article_urls = article_urls[:idx]
 
     # Pre-flight dedup: filter out URLs already in the DB
+    candidate_count = len(article_urls)
     article_urls = await _filter_known_urls(article_urls)
+    new_candidate_count = len(article_urls)
+    if candidate_count and not new_candidate_count:
+        # Distinguishes "link discovery found nothing" (logged above) from
+        # "found links, but every single one is already known" -- both used
+        # to surface identically as last_status="empty" with no clue which
+        # happened, which is exactly what made a batch of stuck surfaces
+        # undiagnosable from the DB alone (2026-09-15 investigation).
+        logger.info(
+            "html_crawl %s: %d candidate links, all already known (genuinely stale)",
+            base_url, candidate_count,
+        )
 
     items: list[CollectedItem] = []
     new_cursor: str | None = article_urls[0] if article_urls else cursor
@@ -188,7 +200,15 @@ async def collect(
             logger.warning("html_crawl article blocked at depth %d: %s", depth, exc)
             continue
         except Exception as exc:
-            logger.warning("html_crawl article fetch failed %s: %s", url, exc)
+            # type(exc).__name__ matters here: str(exc) alone is often blank
+            # or unhelpful for network-level failures (e.g. httpx timeouts/
+            # connection resets), which was the exact blind spot that left a
+            # batch of "genuinely healthy in isolation but 0 items in
+            # production" surfaces undiagnosable (2026-09-15 investigation).
+            logger.warning(
+                "html_crawl article fetch failed %s: %s: %s",
+                url, type(exc).__name__, exc,
+            )
             continue
 
         art_soup = BeautifulSoup(art_resp.text, "html.parser")
@@ -211,6 +231,13 @@ async def collect(
             for child in child_links:
                 if child not in visited and len(items) + len(frontier) < limit * 2:
                     frontier.append((child, next_depth))
+
+    if new_candidate_count and not items:
+        logger.info(
+            "html_crawl %s: %d new candidates attempted, 0 extracted (all "
+            "fetches/extractions failed -- see warnings above for why)",
+            base_url, min(new_candidate_count, limit),
+        )
 
     return items, new_cursor
 
