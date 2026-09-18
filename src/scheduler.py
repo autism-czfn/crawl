@@ -67,7 +67,17 @@ class Scheduler:
         await self._seed_surfaces()
         logger.info("Scheduler started")
         from src.health import register, heartbeat
-        register("scheduler", _TICK_INTERVAL_SEC)
+        # Default stale_multiplier=3.0 (180s budget) was too tight: a single
+        # slow-but-healthy surface batch (e.g. a large enrich_unpaywall DOI
+        # sweep, or an academic-API page under load) legitimately runs past
+        # that before the next surface's per-completion heartbeat fires --
+        # confirmed 2026-09-16 from 20 self-resolving 15-210s flaps in one
+        # day's logs, each with real work (new items, DOI progress) landing
+        # throughout the "stuck" window, never an actual hang. 600s gives
+        # headroom for that plus the added playwright_crawl surfaces (single
+        # global browser slot, _PLAYWRIGHT_CONCURRENCY=1) while still
+        # catching a genuine wedge, which is what this check exists for.
+        register("scheduler", _TICK_INTERVAL_SEC, stale_multiplier=10.0)
 
         while self._running:
             await self._tick()
