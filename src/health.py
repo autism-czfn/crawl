@@ -18,6 +18,7 @@ down).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -30,6 +31,20 @@ from sqlalchemy import text
 from src.storage.db import engine
 
 logger = logging.getLogger(__name__)
+
+# Keep in sync with setup.sh's FULL_TEXT_MIN_LEN (option 10, "FullTxt
+# Downloaded") — same threshold and definition (length(content_body) >=
+# this, any source) so this endpoint's numbers agree with that report.
+FULL_TEXT_MIN_LEN = 1000
+
+# The two /api/health article counts are seq-scan-or-worse queries over all
+# of crawled_items (no index supports either predicate — see the discussion
+# that led here). Recomputing them on every request would mean the LAN
+# monitor's 10s poll pays a full-table scan every 10s, competing with the
+# crawler's own hot-path queries on the same table as it grows. Instead a
+# background loop refreshes a cached value on its own cadence and requests
+# just read it.
+_ARTICLE_COUNTS_REFRESH_SECONDS = 60
 
 _HEARTBEATS: Dict[str, "LoopHeartbeat"] = {}
 
@@ -46,6 +61,16 @@ _unhealthy_since: float | None = None
 class LoopHeartbeat:
     max_staleness_seconds: float
     last_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class ArticleCounts:
+    full_articles_total: int | None = None
+    full_articles_last_24h: int | None = None
+    updated_at: float | None = None
+
+
+_article_counts = ArticleCounts()
 
 
 def register(name: str, expected_interval_seconds: float, stale_multiplier: float = 3.0) -> None:
@@ -73,6 +98,41 @@ async def _db_ok() -> tuple[bool, str]:
         return False, ("unreachable: " + str(exc))[:200]
 
 
+async def _refresh_article_counts() -> None:
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                f"""
+                SELECT
+                    count(*) FILTER (WHERE length(content_body) >= {FULL_TEXT_MIN_LEN}) AS total,
+                    count(*) FILTER (
+                        WHERE length(content_body) >= {FULL_TEXT_MIN_LEN}
+                          AND collected_at > now() - interval '24 hours'
+                    ) AS last_24h
+                FROM crawled_items
+                """
+            )
+        )
+        row = result.one()
+    _article_counts.full_articles_total = row.total
+    _article_counts.full_articles_last_24h = row.last_24h
+    _article_counts.updated_at = time.time()
+
+
+async def _article_counts_loop() -> None:
+    """Background refresh for the /api/health article counts — see the
+    module-level comment on _ARTICLE_COUNTS_REFRESH_SECONDS for why these
+    aren't computed inline per request."""
+    register("health_article_counts", _ARTICLE_COUNTS_REFRESH_SECONDS)
+    while True:
+        try:
+            await _refresh_article_counts()
+        except Exception:
+            logger.exception("article-count refresh failed")
+        heartbeat("health_article_counts")
+        await asyncio.sleep(_ARTICLE_COUNTS_REFRESH_SECONDS)
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="autism-crawler health")
 
@@ -84,8 +144,13 @@ def create_app() -> FastAPI:
         ages = {name: round(now - hb.last_at, 1) for name, hb in _HEARTBEATS.items()}
         stuck = {name: age for name, age in ages.items() if age > _HEARTBEATS[name].max_staleness_seconds}
         ok = db_ok and not stuck
+        counts_age = (round(now - _article_counts.updated_at, 1)
+                      if _article_counts.updated_at is not None else None)
         body = {"status": "ok" if ok else "not_ready", "db": db_detail,
-                "loops_age_seconds": ages, "stuck_loops": stuck}
+                "loops_age_seconds": ages, "stuck_loops": stuck,
+                "full_articles_total": _article_counts.full_articles_total,
+                "full_articles_last_24h": _article_counts.full_articles_last_24h,
+                "full_articles_counts_age_seconds": counts_age}
 
         if not ok:
             if _unhealthy_since is None:
@@ -110,6 +175,7 @@ def create_app() -> FastAPI:
 async def serve(host: str, port: int) -> None:
     import logging
     import uvicorn
+    asyncio.create_task(_article_counts_loop())
     config = uvicorn.Config(create_app(), host=host, port=port, log_level="warning", lifespan="off")
     server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None  # main.py owns SIGTERM/SIGINT, same reasoning as monitor/monitor.py _serve_api
