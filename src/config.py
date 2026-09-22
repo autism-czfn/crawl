@@ -26,6 +26,10 @@ class Settings:
     REDIS_URL: str = os.getenv("REDIS_URL", "")
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
+    # Health check server — polled by the LAN service-monitor (~/data/code/monitor).
+    HEALTH_HOST: str = os.getenv("CRAWLER_HEALTH_HOST", "0.0.0.0")
+    HEALTH_PORT: int = int(os.getenv("CRAWLER_HEALTH_PORT", "8010"))
+
     USER_AGENT: str = f"autism-crawler/1.0 (mailto:{os.getenv('CRAWLER_EMAIL', 'autism-crawler@example.com')})"
     BROWSER_USER_AGENT: str = (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

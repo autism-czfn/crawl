@@ -1,9 +1,12 @@
 """Scheduler: polls surfaces on their configured intervals and dispatches collectors."""
+from __future__ import annotations
+
 import asyncio
 import importlib
 import json
 import logging
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -37,6 +40,8 @@ _COLLECTOR_MAP: dict[str, str] = {
     "sitemap": "src.collectors.sitemap",
     "nhs_api": "src.collectors.nhs",
     "cdc_data": "src.collectors.cdc_data",
+    "link_harvester": "src.collectors.link_harvester",
+    "link_harvester_backfill": "src.collectors.link_harvester_backfill",
 }
 
 _SURFACES_JSON = Path(__file__).parent.parent / "config" / "surfaces.json"
@@ -47,7 +52,7 @@ _STALENESS_CHECK_INTERVAL = 3600   # check staleness once per hour
 # Playwright launches a full Chromium subprocess (~700 MB–1 GB RSS each).
 # Cap concurrent playwright_crawl runs to prevent OOM when many surfaces are due
 # simultaneously (e.g. first run after a config change, or after 24-hour poll fires).
-_PLAYWRIGHT_CONCURRENCY = 2
+_PLAYWRIGHT_CONCURRENCY = 1  # reduced from 2; each Chromium uses ~700 MB on 7.4 GB host
 _playwright_semaphore: asyncio.Semaphore | None = None
 
 
@@ -61,9 +66,22 @@ class Scheduler:
         _playwright_semaphore = asyncio.Semaphore(_PLAYWRIGHT_CONCURRENCY)
         await self._seed_surfaces()
         logger.info("Scheduler started")
+        from src.health import register, heartbeat
+        # Default stale_multiplier=3.0 (180s budget) was too tight: a single
+        # slow-but-healthy surface batch (e.g. a large enrich_unpaywall DOI
+        # sweep, or an academic-API page under load) legitimately runs past
+        # that before the next surface's per-completion heartbeat fires --
+        # confirmed 2026-09-16 from 20 self-resolving 15-210s flaps in one
+        # day's logs, each with real work (new items, DOI progress) landing
+        # throughout the "stuck" window, never an actual hang. 600s gives
+        # headroom for that plus the added playwright_crawl surfaces (single
+        # global browser slot, _PLAYWRIGHT_CONCURRENCY=1) while still
+        # catching a genuine wedge, which is what this check exists for.
+        register("scheduler", _TICK_INTERVAL_SEC, stale_multiplier=10.0)
 
         while self._running:
             await self._tick()
+            heartbeat("scheduler")
             self._tick_count += 1
             # Check Tier-1 staleness once per _STALENESS_CHECK_INTERVAL seconds
             if self._tick_count % (_STALENESS_CHECK_INTERVAL // _TICK_INTERVAL_SEC) == 0:
@@ -89,7 +107,7 @@ class Scheduler:
                     surface = Surface(
                         key=s["key"],
                         platform=s["platform"],
-                        enabled=s.get("enabled", True),
+                        enabled=bool(s.get("enabled", 1)),  # accepts 1/0 or true/false
                         poll_interval_sec=s.get("poll_interval_sec", 3600),
                         max_items_per_run=s.get("max_items", 30),
                         config_json=s.get("config", {}),
@@ -99,9 +117,38 @@ class Scheduler:
                         language=s.get("language", "en"),
                         country=s.get("country"),
                         organization_name=s.get("organization_name"),
+                        domain_tags=s.get("domain_tags"),
+                        topic_tags=s.get("topic_tags"),
                     )
                     session.add(surface)
                     logger.info("Seeded surface: %s", s["key"])
+                else:
+                    # Upsert config fields from surfaces.json.
+                    # Preserve runtime-only fields: last_run_at, last_cursor,
+                    # consecutive_fails, force_recrawl, overrides_json.
+                    file_config = s.get("config", {})
+                    # DB overrides_json wins over file config values
+                    effective_config = {**file_config, **(existing.overrides_json or {})}
+                    await session.execute(
+                        update(Surface)
+                        .where(Surface.key == s["key"])
+                        .values(
+                            platform=s["platform"],
+                            enabled=bool(s.get("enabled", existing.enabled)),  # accepts 1/0 or true/false
+                            poll_interval_sec=s.get("poll_interval_sec", existing.poll_interval_sec),
+                            max_items_per_run=s.get("max_items", existing.max_items_per_run),
+                            config_json=effective_config,
+                            authority_tier=s.get("authority_tier", existing.authority_tier),
+                            source_type=s.get("source_type", existing.source_type),
+                            audience_type=s.get("audience_type", existing.audience_type),
+                            language=s.get("language", existing.language),
+                            country=s.get("country", existing.country),
+                            organization_name=s.get("organization_name", existing.organization_name),
+                            domain_tags=s.get("domain_tags", existing.domain_tags),
+                            topic_tags=s.get("topic_tags", existing.topic_tags),
+                        )
+                    )
+                    logger.debug("Updated surface config: %s", s["key"])
             await session.commit()
 
     async def _tick(self) -> None:
@@ -131,7 +178,27 @@ class Scheduler:
                     ))
 
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Heartbeat as each due surface finishes, not only once after the
+            # WHOLE concurrent batch. register("scheduler", 60s) only gives a
+            # 180s stale budget, and this used to heartbeat once per full
+            # tick, after every concurrently-running surface had finished —
+            # one slow surface (a flaky domain retrying through SSL hiccups,
+            # a slow Playwright render, a big link_harvester_backfill batch)
+            # could starve that single heartbeat past 180s and falsely flag
+            # "scheduler" as stuck even though every other surface finished
+            # fine (same false-alarm shape as enrich_fulltext's
+            # INC-20260912-0003). Per-completion heartbeats bound the gap to
+            # whichever surface is slowest, not the combination of all of
+            # them. return_exceptions=True's job — one broken surface can't
+            # kill the tick — is preserved by the try/except below, since
+            # as_completed() re-raises a task's exception when awaited.
+            from src.health import heartbeat
+            for coro in asyncio.as_completed(tasks):
+                try:
+                    await coro
+                except Exception as exc:
+                    logger.error("scheduler: a surface task failed unexpectedly: %s", exc, exc_info=True)
+                heartbeat("scheduler")
 
     async def _run_surface_throttled(self, surface_key: str) -> None:
         """Wrapper that acquires the playwright semaphore before running."""
@@ -178,7 +245,7 @@ class Scheduler:
 
             except Exception as exc:
                 await session.rollback()
-                logger.error("Surface %s failed: %s", surface_key, exc)
+                logger.error("Surface %s failed: %s\n%s", surface_key, exc, traceback.format_exc())
                 await session.execute(
                     update(Surface)
                     .where(Surface.key == surface_key)
@@ -247,3 +314,47 @@ def _is_due(surface: Surface, now: datetime) -> bool:
         last = last.replace(tzinfo=timezone.utc)
     elapsed = (now - last).total_seconds()
     return elapsed >= surface.poll_interval_sec
+
+
+# ---------------------------------------------------------------------------
+# P3-D: Crawl health metrics
+# ---------------------------------------------------------------------------
+
+async def log_health_metrics() -> None:
+    """Emit structured JSON health metrics every hour."""
+    import json
+    from src.health import register, heartbeat
+    register("health_metrics", 3600)
+    metrics_logger = logging.getLogger("crawl.metrics")
+    while True:
+        try:
+            from sqlalchemy import func
+            from sqlalchemy import select as _select
+            from src.storage.models import CrawledItem as _CrawledItem, Chunk as _Chunk, Surface as _Surface
+
+            async with AsyncSessionLocal() as session:
+                embedding_queue = await session.scalar(
+                    _select(func.count()).select_from(_CrawledItem)
+                    .where(_CrawledItem.embedding.is_(None))
+                    .where(_CrawledItem.content_body.isnot(None))
+                )
+                chunk_queue = await session.scalar(
+                    _select(func.count()).select_from(_CrawledItem)
+                    .where(_CrawledItem.content_body.isnot(None))
+                    .where(_CrawledItem.content_body != "")
+                )
+                fail_surfaces = await session.scalar(
+                    _select(func.count()).select_from(_Surface)
+                    .where(_Surface.consecutive_fails > 3)
+                )
+
+            metrics_logger.info(json.dumps({
+                "metric": "crawl_health",
+                "embedding_queue_depth": embedding_queue,
+                "chunk_queue_depth": chunk_queue,
+                "surfaces_failing": fail_surfaces,
+            }))
+        except Exception as exc:
+            metrics_logger.error("Health metrics error: %s", exc)
+        heartbeat("health_metrics")
+        await asyncio.sleep(3600)

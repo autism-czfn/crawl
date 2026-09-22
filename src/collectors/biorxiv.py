@@ -1,10 +1,18 @@
-"""bioRxiv/medRxiv preprint collector (date-range API, client-side keyword filter)."""
+"""bioRxiv/medRxiv preprint collector (date-range API, client-side keyword filter).
+
+Full-text strategy:
+  All bioRxiv/medRxiv preprints are open access.  For each paper, fetch the
+  full HTML from biorxiv.org/medrxiv.org and extract text with trafilatura.
+  Falls back to PDF if HTML extraction fails.
+"""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
 from src.collectors.base import CollectedItem, normalize_doi
+from src.collectors.fulltext import fetch_biorxiv_fulltext
 from src.http.client import get_shared_client
 
 logger = logging.getLogger(__name__)
@@ -82,7 +90,7 @@ async def collect(
                 source="biorxiv",
                 external_id=doi,
                 description=abstract or None,
-                content_body=None,
+                content_body=None,  # enriched below
                 author=author,
                 authors_json=None,
                 published_at=published_at,
@@ -96,6 +104,22 @@ async def collect(
         )
         if len(items) >= limit:
             break
+
+    # Fetch full text concurrently — all preprints are open access
+    client = get_shared_client()
+
+    async def _enrich(item: CollectedItem) -> CollectedItem:
+        doi = item.get("doi") or item.get("external_id")
+        if doi:
+            text = await fetch_biorxiv_fulltext(client, doi, server=server)
+            if text:
+                item["content_body"] = text
+        return item
+
+    items = list(await asyncio.gather(*[_enrich(item) for item in items]))
+
+    full_count = sum(1 for it in items if it.get("content_body"))
+    logger.info("bioRxiv: %d papers, %d with full text", len(items), full_count)
 
     new_offset = offset + len(collection)
     if len(collection) > 0 and new_offset < total:

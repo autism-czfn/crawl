@@ -7,8 +7,8 @@
 .crawler.pid
 .admin.pid
 *.log
-crawler.log
-admin.log
+logs/*
+!logs/.gitkeep
 
 # ── Python ─────────────────────────────────────────────────────────────────────
 __pycache__/

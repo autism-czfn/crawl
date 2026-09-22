@@ -22,11 +22,13 @@ cd "$(dirname "$0")"
 PROJECT_DIR="$(pwd)"
 PID_FILE="$PROJECT_DIR/.crawler.pid"
 ADMIN_PID_FILE="$PROJECT_DIR/.admin.pid"
-LOG_FILE="$PROJECT_DIR/crawler.log"
-ADMIN_LOG_FILE="$PROJECT_DIR/admin.log"
+LOG_DIR="$PROJECT_DIR/logs"
+LOG_FILE="$LOG_DIR/crawler.log"
+ADMIN_LOG_FILE="$LOG_DIR/admin.log"
+mkdir -p "$LOG_DIR"
 ADMIN_PORT="${ADMIN_PORT:-8001}"
 PYTHON="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}"
-PYTHON="${PYTHON:-$(command -v python)}"
+PYTHON="${PYTHON:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null)}"
 
 # ── Checks ─────────────────────────────────────────────────────────────────────
 check_python() {
@@ -72,7 +74,7 @@ update_csrf_origins() {
     local origins="https://${public_ip},http://127.0.0.1,http://localhost"
 
     if grep -q "^DJANGO_CSRF_TRUSTED_ORIGINS=" .env; then
-        sed -i "s|^DJANGO_CSRF_TRUSTED_ORIGINS=.*|DJANGO_CSRF_TRUSTED_ORIGINS=${origins}|" .env
+        sed -i '' "s|^DJANGO_CSRF_TRUSTED_ORIGINS=.*|DJANGO_CSRF_TRUSTED_ORIGINS=${origins}|" .env
     else
         echo "DJANGO_CSRF_TRUSTED_ORIGINS=${origins}" >> .env
     fi
@@ -91,31 +93,90 @@ run_migrations() {
 }
 
 # ── PID helpers ────────────────────────────────────────────────────────────────
+# Pattern used to identify the crawler process regardless of who started it.
+# Must NOT start with "-" or pgrep will treat it as a flag.
+CRAWLER_PGREP_PATTERN="src[.]main"
+ADMIN_PGREP_PATTERN="admin_site/manage[.]py.*runserver"
+
+# Find the crawler PID by looking for a Python process launched with "-m src.main".
+# Matching " -m src.main" (with space, without a colon suffix) avoids false
+# positives from uvicorn apps whose module path also contains "src.main:app".
+_find_crawler_pid() {
+    ps -eo pid=,command= 2>/dev/null \
+        | awk '$2 ~ /python/ && / -m src[.]main( |$)/ {print $1}' \
+        | head -1
+}
+
+# Find the Django admin PID — always return the PARENT (reloader) process.
+# runserver spawns two processes: a file-watcher parent and an HTTP-server child.
+# Killing the parent takes down both; killing only the child causes the parent
+# to immediately respawn it.  sort -n gives lowest PID = the parent.
+_find_admin_pid() {
+    ps -eo pid=,command= 2>/dev/null \
+        | awk '$2 ~ /python/ && /admin_site\/manage[.]py/ && /runserver/ {print $1}' \
+        | sort -n \
+        | head -1
+}
+
 is_running() {
+    # 1. PID file exists — check the process is alive AND is actually the crawler.
+    #    (The file may contain a stale PID from a shell wrapper, not a python process.)
     if [[ -f "$PID_FILE" ]]; then
         local pid
         pid=$(cat "$PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
-            return 0   # running
+            # Validate: the stored PID must be a python -m src.main process.
+            if ps -p "$pid" -o command= 2>/dev/null \
+               | awk '$1 ~ /python/ && / -m src[.]main( |$)/ {found=1} END {exit !found}'; then
+                return 0   # running, PID file is valid
+            fi
         fi
+        # Dead or wrong process — discard the stale file and fall through.
+        rm -f "$PID_FILE"
     fi
+
+    # 2. Fallback: find by process scan (handles processes started by other
+    #    parents, e.g. a Claude agent).  Adopt the PID so the rest of the
+    #    script can manage it normally.
+    local found_pid
+    found_pid=$(_find_crawler_pid)
+    if [[ -n "$found_pid" ]]; then
+        echo "$found_pid" > "$PID_FILE"   # adopt externally-started process
+        return 0
+    fi
+
     return 1   # not running
 }
 
 stop_existing() {
-    if is_running; then
+    # Refresh / adopt PID before stopping.
+    is_running || true
+
+    if [[ -f "$PID_FILE" ]]; then
         local pid
         pid=$(cat "$PID_FILE")
         warn "Stopping existing crawler process (PID $pid) ..."
-        kill "$pid"
-        # Wait up to 10 s for clean exit
+        kill "$pid" 2>/dev/null || true
+        # Wait up to 10 s for clean exit.
         local i=0
         while kill -0 "$pid" 2>/dev/null && [[ $i -lt 10 ]]; do
             sleep 1; i=$((i + 1))
         done
-        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" || true
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
         rm -f "$PID_FILE"
         success "Stopped."
+    fi
+
+    # Kill any additional stragglers that share the same command pattern
+    # (e.g. child worker processes spawned by the main process).
+    local stragglers
+    stragglers=$(pgrep -f "$CRAWLER_PGREP_PATTERN" 2>/dev/null || true)
+    if [[ -n "$stragglers" ]]; then
+        warn "Killing remaining crawler processes: $(echo "$stragglers" | tr '\n' ' ')"
+        echo "$stragglers" | xargs kill 2>/dev/null || true
+        sleep 2
+        stragglers=$(pgrep -f "$CRAWLER_PGREP_PATTERN" 2>/dev/null || true)
+        [[ -n "$stragglers" ]] && echo "$stragglers" | xargs kill -9 2>/dev/null || true
     fi
 }
 
@@ -165,7 +226,7 @@ start_restart_all() {
     sleep 2
     if kill -0 "$admin_pid" 2>/dev/null; then
         local public_ip
-        public_ip=$(grep "^DJANGO_CSRF_TRUSTED_ORIGINS=" .env | grep -oP 'https://\K[^,]+' | head -1)
+        public_ip=$(grep "^DJANGO_CSRF_TRUSTED_ORIGINS=" .env | sed 's/.*https:\/\/\([^,]*\).*/\1/' | head -1)
         success "Django admin started  (PID $admin_pid)  →  https://${public_ip}/admin/"
     else
         error "Django admin exited immediately. Check logs:"
@@ -188,31 +249,83 @@ only_migrate() {
     echo
 }
 
+# ── Option 9 — Run test suite ──────────────────────────────────────────────────
+run_tests() {
+    echo
+    if ! "$PYTHON" -m pytest --version &>/dev/null; then
+        warn "pytest not found — installing test dependencies ..."
+        pip install --quiet pytest pytest-asyncio
+    fi
+
+    info "Running test suite (tests/) ..."
+    echo
+    # Not `check_env`-gated and no `run_migrations` — the suite is pure unit
+    # tests (no live DB/network calls), so it works even before first setup.
+    # Guarded with if/then, not bare `set -e`, so a failing test reports a
+    # clear summary instead of silently killing the whole menu loop.
+    if "$PYTHON" -m pytest tests/ -v; then
+        echo
+        success "All tests passed."
+    else
+        echo
+        error "Some tests failed — see output above."
+    fi
+    echo
+}
+
 # ── Django admin PID helpers ───────────────────────────────────────────────────
 is_admin_running() {
+    # 1. PID file exists — validate it's alive AND is actually the Django admin.
     if [[ -f "$ADMIN_PID_FILE" ]]; then
         local pid
         pid=$(cat "$ADMIN_PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
-            return 0
+            if ps -p "$pid" -o command= 2>/dev/null \
+               | awk '$1 ~ /python/ && /admin_site\/manage[.]py/ && /runserver/ {found=1} END {exit !found}'; then
+                return 0
+            fi
         fi
+        rm -f "$ADMIN_PID_FILE"
     fi
+
+    # 2. Process-scan fallback — adopt externally-started admin process.
+    local found_pid
+    found_pid=$(_find_admin_pid)
+    if [[ -n "$found_pid" ]]; then
+        echo "$found_pid" > "$ADMIN_PID_FILE"   # adopt externally-started process
+        return 0
+    fi
+
     return 1
 }
 
 stop_existing_admin() {
-    if is_admin_running; then
+    # Refresh / adopt PID before stopping.
+    is_admin_running || true
+
+    if [[ -f "$ADMIN_PID_FILE" ]]; then
         local pid
         pid=$(cat "$ADMIN_PID_FILE")
         warn "Stopping existing Django admin process (PID $pid) ..."
-        kill "$pid"
+        kill "$pid" 2>/dev/null || true
         local i=0
         while kill -0 "$pid" 2>/dev/null && [[ $i -lt 10 ]]; do
             sleep 1; i=$((i + 1))
         done
-        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" || true
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
         rm -f "$ADMIN_PID_FILE"
         success "Stopped."
+    fi
+
+    # Kill any stragglers.
+    local stragglers
+    stragglers=$(pgrep -f "$ADMIN_PGREP_PATTERN" 2>/dev/null || true)
+    if [[ -n "$stragglers" ]]; then
+        warn "Killing remaining Django admin processes: $(echo "$stragglers" | tr '\n' ' ')"
+        echo "$stragglers" | xargs kill 2>/dev/null || true
+        sleep 2
+        stragglers=$(pgrep -f "$ADMIN_PGREP_PATTERN" 2>/dev/null || true)
+        [[ -n "$stragglers" ]] && echo "$stragglers" | xargs kill -9 2>/dev/null || true
     fi
 }
 
@@ -289,9 +402,8 @@ show_db_stats() {
         echo; return
     fi
 
-    # Use the project's own Python/psycopg2 — no psql needed
     "$PYTHON" - << 'PYEOF'
-import os, sys, json, pathlib
+import os, sys, json, pathlib, re
 
 # ── Load .env ──
 for line in pathlib.Path(".env").read_text().splitlines():
@@ -305,43 +417,599 @@ if not db_url:
     print("  \033[0;31m[ERROR]\033[0m  DATABASE_URL not set in .env")
     sys.exit(1)
 
-# Strip SQLAlchemy driver prefix (e.g. postgresql+asyncpg:// → postgresql://)
-import re
 db_url = re.sub(r"^(postgresql)\+\w+://", r"\1://", db_url)
 
 BOLD  = "\033[1m"
+DIM   = "\033[2m"
 GREEN = "\033[0;32m"
+CYAN  = "\033[0;36m"
 WARN  = "\033[1;33m"
-ERR   = "\033[0;31m"
 RESET = "\033[0m"
 
-# ── DB size & crawled items ──
-db_size = item_count = "N/A"
+def bar(n, total, width=20):
+    """Simple ASCII progress bar."""
+    if total == 0:
+        return "[" + "-" * width + "]"
+    filled = int(round(n / total * width))
+    return "[" + "█" * filled + "─" * (width - filled) + "]"
+
+def pct(n, total):
+    return f"{n/total*100:.0f}%" if total else "─"
+
 try:
     import psycopg2
     conn = psycopg2.connect(db_url)
     cur  = conn.cursor()
+
+    # ── Header: DB overview ───────────────────────────────────────────────────
     cur.execute("SELECT pg_size_pretty(pg_database_size(current_database()));")
     db_size = cur.fetchone()[0].strip()
+
     cur.execute("SELECT COUNT(*) FROM crawled_items;")
-    item_count = f"{cur.fetchone()[0]:,}"
+    total_items = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM chunks;")
+    total_chunks = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL;")
+    total_embedded = cur.fetchone()[0]
+
+    print(f"  {BOLD}DB size:{RESET}        {GREEN}{db_size}{RESET}")
+    print(f"  {BOLD}Total articles:{RESET} {GREEN}{total_items:,}{RESET}")
+    print(f"  {BOLD}Total chunks:{RESET}   {GREEN}{total_chunks:,}{RESET}  "
+          f"({GREEN}{total_embedded:,}{RESET} embedded / indexed)")
+    print()
+
+    # ── Load tier info from surfaces.json ─────────────────────────────────────
+    surfaces = json.loads(pathlib.Path("config/surfaces.json").read_text())
+    tier_by_key = {s["key"]: s.get("authority_tier") for s in surfaces}
+
+    # ── Per-source breakdown (tier 1 & 2 only) ────────────────────────────────
+    cur.execute("""
+        SELECT
+            ci.surface_key,
+            COUNT(*)                                            AS total,
+            COUNT(ci.content_body)                             AS has_content,
+            COUNT(CASE WHEN LENGTH(ci.content_body) >= 1000
+                       THEN 1 END)                             AS full_text,
+            COUNT(CASE WHEN ci.content_body IS NOT NULL
+                        AND LENGTH(ci.content_body) < 1000
+                       THEN 1 END)                             AS abstract_only,
+            COUNT(DISTINCT ch.crawled_item_id)                 AS chunked,
+            COUNT(CASE WHEN ch.embedding IS NOT NULL THEN 1 END) AS embedded
+        FROM crawled_items ci
+        LEFT JOIN chunks ch ON ch.crawled_item_id = ci.id
+        GROUP BY ci.surface_key
+        ORDER BY ci.surface_key;
+    """)
+    rows = cur.fetchall()
+    # {surface_key: (total, has_content, full_text, abstract_only, chunked, embedded)}
+    stats = {r[0]: r[1:] for r in rows}
+
+    for tier_label, tier_num in [("Tier 1  (Official / Government)", 1),
+                                  ("Tier 2  (Academic / Medical)", 2)]:
+        tier_keys = sorted([k for k, t in tier_by_key.items() if t == tier_num])
+        if not tier_keys:
+            continue
+
+        print(f"  {BOLD}{'─'*70}{RESET}")
+        print(f"  {BOLD}{CYAN}{tier_label}{RESET}")
+        print(f"  {BOLD}{'─'*70}{RESET}")
+        print(f"  {BOLD}{'Surface':<32} {'Total':>6} {'FullTxt':>7} {'Abstract':>8} "
+              f"{'Chunked':>7} {'Embedded':>8}  Coverage{RESET}")
+        print(f"  {'─'*32} {'─'*6} {'─'*7} {'─'*8} {'─'*7} {'─'*8}  {'─'*22}")
+
+        tier_total = tier_full = tier_abstract = tier_chunked = tier_embedded = 0
+
+        for key in tier_keys:
+            if key not in stats:
+                # Surface enabled but nothing crawled yet
+                print(f"  {key:<32} {'─':>6} {'─':>7} {'─':>8} {'─':>7} {'─':>8}  {DIM}no data yet{RESET}")
+                continue
+
+            total, has_content, full_text, abstract_only, chunked, embedded = stats[key]
+            tier_total    += total
+            tier_full     += full_text
+            tier_abstract += abstract_only
+            tier_chunked  += chunked
+            tier_embedded += embedded
+
+            emb_bar = bar(embedded, total)
+            print(f"  {key:<32} {total:>6,} {full_text:>7,} {abstract_only:>8,} "
+                  f"{chunked:>7,} {embedded:>8,}  {emb_bar} {pct(embedded,total):>4}")
+
+        print(f"  {'─'*32} {'─'*6} {'─'*7} {'─'*8} {'─'*7} {'─'*8}")
+        print(f"  {BOLD}{'SUBTOTAL':<32} {tier_total:>6,} {tier_full:>7,} "
+              f"{tier_abstract:>8,} {tier_chunked:>7,} {tier_embedded:>8,}{RESET}")
+        print()
+
+    # ── Embedding coverage summary ─────────────────────────────────────────────
+    cur.execute("""
+        SELECT COUNT(*) FROM crawled_items ci
+        WHERE EXISTS (SELECT 1 FROM chunks ch
+                      WHERE ch.crawled_item_id = ci.id
+                        AND ch.embedding IS NOT NULL);
+    """)
+    items_with_embeddings = cur.fetchone()[0]
+
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    print(f"  {BOLD}Vector index coverage{RESET}")
+    print(f"  {'─'*70}")
+    print(f"  Articles with ≥1 embedded chunk : "
+          f"{GREEN}{items_with_embeddings:,}{RESET} / {total_items:,}  "
+          f"({pct(items_with_embeddings, total_items)})")
+    print(f"  Chunks embedded / total         : "
+          f"{GREEN}{total_embedded:,}{RESET} / {total_chunks:,}  "
+          f"({pct(total_embedded, total_chunks)})")
+    print(f"  {bar(total_embedded, total_chunks, width=40)}")
+    print()
+
     cur.close()
     conn.close()
-except Exception as e:
-    print(f"  {WARN}[WARN]{RESET}   DB query failed: {e}")
 
-# ── Active sources from surfaces.json ──
-source_count = "N/A"
+except Exception as e:
+    import traceback
+    print(f"  {WARN}[WARN]{RESET}  DB query failed: {e}")
+    traceback.print_exc()
+PYEOF
+}
+
+# ── Option 10 — Show crawled full articles by track ───────────────────────────
+show_track_stats() {
+    echo
+    info "=== Backlog & Discovery Report (Tier 1 & Tier 2) ==="
+    info "Report generated at (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
+    echo
+
+    if [[ ! -f .env ]]; then
+        error ".env not found — cannot determine DATABASE_URL."
+        echo; return
+    fi
+
+    "$PYTHON" - << 'PYEOF'
+import os, sys, pathlib, re
+
+# ── Load .env ──
+for line in pathlib.Path(".env").read_text().splitlines():
+    line = line.strip()
+    if line and not line.startswith("#") and "=" in line:
+        k, _, v = line.partition("=")
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+db_url = os.environ.get("DATABASE_URL", "")
+if not db_url:
+    print("  \033[0;31m[ERROR]\033[0m  DATABASE_URL not set in .env")
+    sys.exit(1)
+
+db_url = re.sub(r"^(postgresql)\+\w+://", r"\1://", db_url)
+
+BOLD  = "\033[1m"
+DIM   = "\033[2m"
+GREEN = "\033[0;32m"
+CYAN  = "\033[0;36m"
+WARN  = "\033[1;33m"
+RESET = "\033[0m"
+
+# "Full article" threshold matches show_db_stats (option 7): content_body
+# >= 1000 chars. Below that (but not NULL) is treated as abstract-only —
+# typical of academic-API sources before Unpaywall enrichment lands real
+# full text (see src/pipeline.py enrich_unpaywall/enrich_fulltext).
+FULL_TEXT_MIN_LEN = 1000
+
 try:
-    surfaces = json.loads(pathlib.Path("config/surfaces.json").read_text())
-    source_count = sum(1 for s in surfaces if s.get("enabled", True))
-except Exception as e:
-    print(f"  {WARN}[WARN]{RESET}   Could not read surfaces.json: {e}")
+    import psycopg2
+    conn = psycopg2.connect(db_url)
+    cur  = conn.cursor()
 
-print(f"  {BOLD}DB Size:       {RESET}{GREEN}{db_size}{RESET}")
-print(f"  {BOLD}Crawled Items: {RESET}{GREEN}{item_count}{RESET}")
-print(f"  {BOLD}Active Sources:{RESET}{GREEN}{source_count}{RESET}  (config/surfaces.json)")
-print()
+    # ── Source breakdown by track: crawl vs claude -p WebSearch discovery ──
+    # crawled_items.source is 'claude_websearch' for rows landed by
+    # src/discovery/loop.py (crawl.txt section 13's "第4层" WebSearch
+    # supplement) and the collector's own platform name (html_crawl,
+    # sitemap, pubmed, ...) for everything else. FullTxt here uses
+    # FULL_TEXT_MIN_LEN (content_body >= 1000 chars), same threshold used
+    # throughout this report. A track/domain_tag is unnested from the
+    # domain_tags jsonb array (same approach as the crawl_domain_tag_
+    # coverage view, migration 0020) — an item tagged ["sleep","eating"]
+    # is correctly counted under both, not just its first tag.
+    cur.execute(f"""
+        SELECT
+            domain_value AS track,
+            COUNT(*) FILTER (WHERE source = 'claude_websearch') AS websearch_total,
+            COUNT(*) FILTER (WHERE source = 'claude_websearch'
+                              AND LENGTH(content_body) >= {FULL_TEXT_MIN_LEN}) AS websearch_full,
+            COUNT(*) FILTER (WHERE source != 'claude_websearch') AS crawl_total,
+            COUNT(*) FILTER (WHERE source != 'claude_websearch'
+                              AND LENGTH(content_body) >= {FULL_TEXT_MIN_LEN}) AS crawl_full
+        FROM crawled_items,
+             LATERAL jsonb_array_elements_text(
+                 COALESCE(domain_tags, '[]'::jsonb)
+             ) AS domain_value
+        WHERE authority_tier IN (1, 2)
+        GROUP BY domain_value
+        ORDER BY websearch_total DESC, track;
+    """)
+    source_rows = cur.fetchall()
+
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    print(f"  {BOLD}{CYAN}Source breakdown by track — crawl vs claude -p WebSearch{RESET}")
+    print(f"  {BOLD}{'─'*70}{RESET}")
+
+    if not source_rows:
+        print(f"  {WARN}No Tier 1/2 items with a domain_tags value found.{RESET}")
+    else:
+        print(f"  {BOLD}{'Track':<14} {'WebSearch':>9} {'WS FullTxt':>10} {'Crawl':>8} {'Crawl FullTxt':>13}{RESET}")
+        print(f"  {'─'*14} {'─'*9} {'─'*10} {'─'*8} {'─'*13}")
+
+        sum_ws_total = sum_ws_full = sum_crawl_total = sum_crawl_full = 0
+        for track, ws_total, ws_full, crawl_total, crawl_full in source_rows:
+            print(f"  {track:<14} {ws_total:>9,} {ws_full:>10,} {crawl_total:>8,} {crawl_full:>13,}")
+            sum_ws_total    += ws_total
+            sum_ws_full     += ws_full
+            sum_crawl_total += crawl_total
+            sum_crawl_full  += crawl_full
+
+        print(f"  {'─'*14} {'─'*9} {'─'*10} {'─'*8} {'─'*13}")
+        print(f"  {BOLD}{'TOTAL':<14} {sum_ws_total:>9,} {sum_ws_full:>10,} {sum_crawl_total:>8,} {sum_crawl_full:>13,}{RESET}")
+        print()
+        print(f"  {DIM}\"WebSearch\" = source='claude_websearch' (src/discovery/loop.py — the "
+              f"claude -p WebSearch discovery layer, crawl.txt section 13). \"Crawl\" = "
+              f"everything else (official APIs, sitemap/RSS, html_crawl/playwright_crawl). "
+              f"\"Total\" counts an item once per track it's tagged with — an item tagged "
+              f"[\"sleep\",\"eating\"] counts under both, so the TOTAL row doesn't sum to the "
+              f"DB's total row count (same caveat applies to every by-track table below).{RESET}")
+        print()
+
+    # ── Unprocessed queue by track (how bad is the backlog) ──
+    # Four mutually-exclusive, collectively-exhaustive columns per row, so
+    # they sum exactly to "Total" (every Tier 1/2 item with this domain tag
+    # falls into exactly one — see the FILTER clauses below for the
+    # precise, disjoint split):
+    #   downloaded  — fetched and parsed successfully; real content
+    #                 (content_body >= FULL_TEXT_MIN_LEN chars, ANY source)
+    #   waiting     — genuinely queued for an automated retry:
+    #                   • has a DOI, Unpaywall hasn't been asked yet (or
+    #                     said OA but we still lack a URL)
+    #                   • Unpaywall gave a real oa_url, not fetched yet
+    #                   • NO DOI, but from a source enrich_no_doi_urls
+    #                     covers (src/pipeline.py's _NO_DOI_ACADEMIC_SOURCES:
+    #                     openalex/core/europepmc/doaj/semanticscholar/
+    #                     pubmed/clinicaltrials) — fetched by url directly,
+    #                     no DOI needed
+    #   skipped     — a permanent negative outcome, won't be retried:
+    #                   • Unpaywall confirmed no free copy exists
+    #                   • enrich_fulltext gave up after failures (never-
+    #                     succeeded domain given up 24h after first
+    #                     failure, migration 0025; or a single URL given up
+    #                     after 3 attempts of its own); written as '' so it
+    #                     stops occupying "waiting" — see _write()'s
+    #                     docstring in src/pipeline.py
+    #                   • a domain manually marked dead via a
+    #                     "blocked_domain" entry in config/surfaces.json
+    #                     (see the "Manually skipped" breakdown further
+    #                     below)
+    #                   • NO DOI, from a source enrich_no_doi_urls does NOT
+    #                     cover (youtube, html_crawl, search_websearch_queue,
+    #                     claude_websearch, rss, sitemap, playwright_crawl,
+    #                     nhs_api, cdc_data) — nothing will ever fetch these
+    #                     automatically, so they belong with the other
+    #                     permanent outcomes, not "waiting"
+    #   abstract    — has SOME content, just shorter than FULL_TEXT_MIN_LEN.
+    #                 Permanently stuck there: enrich_fulltext's (and
+    #                 enrich_no_doi_urls') own query requires content_body
+    #                 IS NULL to even consider a row, so an item that
+    #                 already has short content is NEVER revisited.
+    surfaces_path = pathlib.Path("config/surfaces.json")
+    blocked_domains = []
+    if surfaces_path.exists():
+        try:
+            import json as _json
+            all_surfaces = _json.loads(surfaces_path.read_text())
+            blocked_domains = [
+                s["blocked_domain"] for s in all_surfaces
+                if isinstance(s, dict) and s.get("blocked_domain")
+            ]
+        except Exception as exc:
+            print(f"  {WARN}Failed to parse config/surfaces.json: {exc}{RESET}")
+    blocked_patterns = [f"%{d}%" for d in blocked_domains]
+
+    # No-DOI items split by whether enrich_no_doi_urls (src/pipeline.py)
+    # actually covers their source — keep this literally in sync with that
+    # function's _NO_DOI_ACADEMIC_SOURCES tuple.
+    _no_doi_retriable_sources = (
+        'openalex', 'core', 'europepmc', 'doaj',
+        'semanticscholar', 'pubmed', 'clinicaltrials',
+    )
+
+    # Every FILTER's WHERE is an explicit, disjoint condition (not relying
+    # on evaluation order), so this is a true mutually-exclusive partition
+    # of every Tier 1/2 item tagged with this track — see the comment block
+    # above for what each column merges together.
+    cur.execute(f"""
+        SELECT
+            domain_value AS track,
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE length(content_body) >= {FULL_TEXT_MIN_LEN}) AS downloaded,
+            COUNT(*) FILTER (
+                WHERE (content_body IS NULL OR content_body = '')
+                  AND (
+                    (doi IS NOT NULL AND (
+                        (open_access IS NULL OR (open_access = true AND oa_url IS NULL))  -- awaiting_oa_check
+                        OR (content_body IS NULL AND open_access = true AND oa_url IS NOT NULL)  -- awaiting_fulltext
+                    ))
+                    OR (doi IS NULL AND source = ANY(%(retriable)s))  -- no-DOI, but enrich_no_doi_urls covers it
+                  )
+            ) AS waiting,
+            COUNT(*) FILTER (
+                WHERE (content_body IS NULL OR content_body = '')
+                  AND (
+                    (doi IS NOT NULL AND (
+                        open_access = false  -- not_open_access (guard above excludes
+                                             -- the rare case where content_body is
+                                             -- already populated from a non-OA source
+                                             -- despite Unpaywall saying not-OA — that
+                                             -- counts as "downloaded" instead)
+                        OR (content_body = '' AND open_access = true AND oa_url IS NOT NULL)  -- skipped_error
+                    ))
+                    OR (doi IS NULL AND NOT (source = ANY(%(retriable)s)))  -- no-DOI, nothing will ever fetch it
+                  )
+            ) AS skipped,
+            COUNT(*) FILTER (
+                WHERE content_body IS NOT NULL AND content_body != ''
+                  AND length(content_body) < {FULL_TEXT_MIN_LEN}
+            ) AS abstract
+        FROM crawled_items,
+             LATERAL jsonb_array_elements_text(
+                 COALESCE(domain_tags, '[]'::jsonb)
+             ) AS domain_value
+        WHERE authority_tier IN (1, 2)
+        GROUP BY domain_value
+        ORDER BY waiting DESC;
+    """, {"retriable": list(_no_doi_retriable_sources)})
+    queue_rows = cur.fetchall()
+
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    print(f"  {BOLD}{CYAN}Unprocessed queue by track (how bad is the backlog){RESET}")
+    print(f"  {BOLD}{'─'*70}{RESET}")
+
+    if not queue_rows:
+        print(f"  {WARN}No Tier 1/2 queue data found.{RESET}")
+    else:
+        cols = [("Total", 9), ("FullTxt Downloaded", 19), ("Waiting", 9), ("Skipped", 9), ("Abstract", 9)]
+
+        header = f"  {BOLD}{'Track':<14} " + " ".join(f"{name:>{w}}" for name, w in cols) + RESET
+        rule = f"  {'─'*14} " + " ".join('─'*w for _, w in cols)
+        print(header)
+        print(rule)
+
+        sums = [0] * len(cols)
+        for row in queue_rows:
+            track = row[0]
+            values = row[1:1 + len(cols)]
+            print(f"  {track:<14} " + " ".join(f"{v:>{w},}" for v, (_, w) in zip(values, cols)))
+            sums = [s + v for s, v in zip(sums, values)]
+
+        print(rule)
+        print(f"  {BOLD}{'TOTAL':<14} " + " ".join(f"{v:>{w},}" for v, (_, w) in zip(sums, cols)) + RESET)
+        print()
+        print(f"  {DIM}Every column is mutually exclusive — they always sum to \"Total\" "
+              f"exactly. \"FullTxt Downloaded\" = content_body >= {FULL_TEXT_MIN_LEN} chars, "
+              f"ANY source — same \"FullTxt\" definition and threshold used in the source-"
+              f"breakdown table above.{RESET}")
+        print(f"  {DIM}\"Waiting\" = genuinely queued for an automated retry: Awaiting OA-check "
+              f"(has a DOI, hasn't been asked to Unpaywall yet) + Awaiting fulltext (Unpaywall "
+              f"gave a real URL, hasn't been fetched yet) + no-DOI items from a source "
+              f"enrich_no_doi_urls covers (OpenAlex/Core/EuropePMC/DOAJ/Semantic Scholar/"
+              f"PubMed/ClinicalTrials.gov — fetched by url directly, no DOI needed).{RESET}")
+        print(f"  {DIM}\"Skipped\" = a permanent negative outcome, won't be retried: Not open "
+              f"access (Unpaywall confirmed no free copy exists) + Skipped/error "
+              f"(enrich_fulltext gave up after failures — including "
+              f"{len(blocked_domains)} domain{'s' if len(blocked_domains) != 1 else ''} "
+              f"manually marked dead in config/surfaces.json, see the \"Manually skipped\" "
+              f"breakdown further below) + no-DOI items from a source nothing will ever fetch "
+              f"(YouTube — no caption available; html_crawl — extraction already failed once; "
+              f"WebSearch queue, RSS, sitemap, and a few smaller sources).{RESET}")
+        print(f"  {DIM}\"Abstract\" = has SOME content, just shorter than {FULL_TEXT_MIN_LEN} "
+              f"chars. Permanently stuck there, not \"Waiting\": enrich_fulltext's (and "
+              f"enrich_no_doi_urls') own query requires content_body IS NULL to even look at "
+              f"a row, so these are never revisited.{RESET}")
+        print()
+
+    # ── Manually skipped, one row per configured domain ────────────────────
+    # Manually-skipped items are folded into "Skipped" in the by-track
+    # table above (grouped by track via domain_tags), so a matched item
+    # with an empty domain_tags array (jsonb_array_elements_text on '[]'
+    # yields zero rows) or with authority_tier NOT IN (1, 2) never
+    # surfaces there at all — even though it genuinely matched a
+    # blocked_domain pattern. That silently hides some of the 8 configured
+    # domains from the table above. This section lists all of them —
+    # always exactly len(blocked_domains) rows, regardless of tags/tier —
+    # so nothing configured here goes invisible.
+    if blocked_domains:
+        cur.execute("""
+            SELECT
+                bd.domain,
+                COUNT(ci.id) AS total_matched,
+                COUNT(ci.id) FILTER (
+                    WHERE ci.authority_tier IN (1, 2)
+                      AND jsonb_array_length(COALESCE(ci.domain_tags, '[]'::jsonb)) > 0
+                ) AS counted_above
+            FROM unnest(%s::text[], %s::text[]) AS bd(domain, pattern)
+            LEFT JOIN crawled_items ci
+              ON ci.doi IS NOT NULL AND ci.oa_url IS NOT NULL
+              AND ci.oa_url LIKE bd.pattern
+            GROUP BY bd.domain
+            ORDER BY total_matched DESC, bd.domain;
+        """, (blocked_domains, blocked_patterns))
+        detail_rows = cur.fetchall()
+
+        print(f"  {BOLD}{'─'*70}{RESET}")
+        print(f"  {BOLD}{CYAN}Manually skipped — detail by domain ({len(blocked_domains)} configured){RESET}")
+        print(f"  {BOLD}{'─'*70}{RESET}")
+        print(f"  {BOLD}{'Domain':<42} {'Matched items':>14} {'Shown above':>12}{RESET}")
+        print(f"  {'─'*42} {'─'*14} {'─'*12}")
+        for domain, total_matched, counted_above in detail_rows:
+            hidden = total_matched - counted_above
+            flag = f" {WARN}(hidden — no domain_tags / tier≠1,2){RESET}" if hidden else ""
+            print(f"  {domain:<42} {total_matched:>14,} {counted_above:>12,}{flag}")
+        print()
+        print(f"  {DIM}\"Matched items\" = every crawled_items row (any tier, any/no domain_tags) "
+              f"whose oa_url matches this domain. \"Shown above\" = how many of those also had a "
+              f"non-empty domain_tags AND authority_tier in (1, 2), so they actually contribute "
+              f"to the \"Skipped\" column in the by-track table above. A domain with 0 matched "
+              f"items here simply has no crawled row with that oa_url yet.{RESET}")
+        print()
+
+    # ── WebSearch discovery queue (search repo's live-query fallback) ─────
+    # search_discovery_requests — search repo writes rows here directly via
+    # its own asyncpg pool (no HTTP API, same Postgres instance — see
+    # migration 0023 and src/discovery/search_queue_loop.py's docstring).
+    # status: pending/processing = not yet processed by crawl's
+    # search_queue_loop (processing = claimed mid-batch, or briefly stuck
+    # and about to be recovered); done/out_of_scope/failed = processed
+    # (a "failed" row with next_retry_at set will still be retried later —
+    # it counts as processed for *this* pass, not permanently resolved).
+    LIST_LIMIT = 20
+
+    cur.execute("SELECT status, COUNT(*) FROM search_discovery_requests GROUP BY status;")
+    status_counts = dict(cur.fetchall())
+
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    print(f"  {BOLD}{CYAN}WebSearch discovery queue (search repo → search_discovery_requests){RESET}")
+    print(f"  {BOLD}{'─'*70}{RESET}")
+
+    if not status_counts:
+        print(f"  {WARN}No rows in search_discovery_requests — search hasn't written anything "
+              f"there yet (this is not a crawl-side processing gap).{RESET}")
+        print()
+    else:
+        not_processed_total = status_counts.get("pending", 0) + status_counts.get("processing", 0)
+        processed_total = (status_counts.get("done", 0) + status_counts.get("out_of_scope", 0)
+                            + status_counts.get("failed", 0))
+
+        print(f"  Not processed: {WARN}{not_processed_total:,}{RESET}  "
+              f"(pending={status_counts.get('pending', 0):,}, "
+              f"processing={status_counts.get('processing', 0):,})")
+        print(f"  Processed:     {GREEN}{processed_total:,}{RESET}  "
+              f"(done={status_counts.get('done', 0):,}, "
+              f"out_of_scope={status_counts.get('out_of_scope', 0):,}, "
+              f"failed={status_counts.get('failed', 0):,})")
+        print()
+
+        # Detailed per-URL listing (not-processed + processed rows) disabled
+        # for now — the summary counts above are good enough day-to-day.
+        # Uncomment this block to see individual queue entries again.
+        #
+        # cur.execute(f"""
+        #     SELECT id, url, status, discovered_at, retry_count, next_retry_at
+        #     FROM search_discovery_requests
+        #     WHERE status IN ('pending', 'processing')
+        #     ORDER BY discovered_at ASC
+        #     LIMIT {LIST_LIMIT};
+        # """)
+        # pending_rows = cur.fetchall()
+        #
+        # print(f"  {BOLD}Not-processed entries{RESET} (oldest first, "
+        #       f"showing up to {LIST_LIMIT} of {not_processed_total:,}):")
+        # if not pending_rows:
+        #     print(f"    {DIM}(none){RESET}")
+        # else:
+        #     for rid, url, status, discovered_at, retry_count, next_retry_at in pending_rows:
+        #         extra = f" retry={retry_count}" if retry_count else ""
+        #         if next_retry_at:
+        #             extra += f" next_retry={next_retry_at:%Y-%m-%d %H:%M}"
+        #         print(f"    #{rid:<6} [{status:<10}] {discovered_at:%Y-%m-%d %H:%M}  {url}{extra}")
+        # print()
+        #
+        # cur.execute(f"""
+        #     SELECT id, url, status, processed_at, error_note, retry_count,
+        #            classifier_tier, classifier_reason, promoted_surface_key
+        #     FROM search_discovery_requests
+        #     WHERE status IN ('done', 'out_of_scope', 'failed')
+        #     ORDER BY processed_at DESC
+        #     LIMIT {LIST_LIMIT};
+        # """)
+        # processed_rows = cur.fetchall()
+        #
+        # print(f"  {BOLD}Processed entries{RESET} (most recently processed first, "
+        #       f"showing up to {LIST_LIMIT} of {processed_total:,}):")
+        # if not processed_rows:
+        #     print(f"    {DIM}(none){RESET}")
+        # else:
+        #     for (rid, url, status, processed_at, error_note, retry_count,
+        #          classifier_tier, classifier_reason, promoted_surface_key) in processed_rows:
+        #         ts = f"{processed_at:%Y-%m-%d %H:%M}" if processed_at else "?"
+        #         note = f"  ({error_note})" if error_note else ""
+        #         print(f"    #{rid:<6} [{status:<12}] {ts}  {url}{note}")
+        #         # Auto-classifier trail (websearch.txt 十九, made automatic —
+        #         # src/discovery/classifier.py + surfaces_writer.py): shown as
+        #         # a second indented line so a promoted/rejected domain is
+        #         # visible at a glance without cluttering the main line above.
+        #         if promoted_surface_key:
+        #             print(f"      {GREEN}→ promoted as {promoted_surface_key}{RESET} "
+        #                   f"(tier{classifier_tier}, {classifier_reason!r})")
+        #         elif classifier_reason:
+        #             print(f"      {DIM}classifier: tier={classifier_tier} — {classifier_reason!r}{RESET}")
+        # print()
+
+        print(f"  {DIM}\"failed\" rows with a retry policy (websearch.txt 15.2) get picked up "
+              f"again at next_retry_at — see the not-processed list once that time arrives. "
+              f"\"out_of_scope\" = domain wasn't already a recognized tier1/2 surface; the Haiku "
+              f"classifier (src/discovery/classifier.py) then either promoted it into "
+              f"config/surfaces.json (shown as \"→ promoted as ...\" above) or rejected it "
+              f"(shown as \"classifier: ...\") — websearch.txt 十九.{RESET}")
+        print()
+
+    cur.close()
+    conn.close()
+
+except Exception as e:
+    import traceback
+    print(f"  {WARN}[WARN]{RESET}  DB query failed: {e}")
+    traceback.print_exc()
+
+# ── Last enrichment cycle (from logs/crawler.log, not the DB) ─────────────
+# enrich_fulltext_loop runs every 30 min and logs its own result EVERY time
+# now (including 0 — see src/pipeline.py), so the last matching line is
+# always the true most-recent cycle, never a stale nonzero one from
+# several cycles back.
+import re as _re
+try:
+    log_path = pathlib.Path("logs/crawler.log")
+    with open(log_path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - 800_000))  # scheduler/collector logging in between
+        # the two enrichment lines can be verbose enough to push them apart by
+        # 300KB+ within a single enrichment cycle — 800KB gives real headroom
+        tail = f.read().decode("utf-8", errors="replace")
+
+    oa_matches = _re.findall(
+        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) INFO:src\.pipeline:enrich_unpaywall: resolved (\d+) OA URLs",
+        tail, _re.MULTILINE,
+    )
+    ft_matches = _re.findall(
+        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) INFO:src\.pipeline:enrich_fulltext: enriched (\d+) records with full text",
+        tail, _re.MULTILINE,
+    )
+
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    print(f"  {BOLD}{CYAN}Last enrichment cycle (from logs/crawler.log){RESET}")
+    print(f"  {BOLD}{'─'*70}{RESET}")
+    if ft_matches:
+        ts, n = ft_matches[-1]
+        print(f"  Full articles downloaded (last cycle, every ~5 min): {GREEN}{int(n)}{RESET}  "
+              f"{DIM}(logged at {ts}, server-local time — not UTC){RESET}")
+    else:
+        print(f"  {WARN}No enrich_fulltext cycle found in the last ~300KB of logs/crawler.log.{RESET}")
+    if oa_matches:
+        ts, n = oa_matches[-1]
+        print(f"  OA-status checks resolved (same cycle):        {int(n)}  "
+              f"{DIM}(logged at {ts}, server-local time — not UTC){RESET}")
+    print()
+except FileNotFoundError:
+    print(f"  {WARN}logs/crawler.log not found — can't report the last enrichment cycle.{RESET}")
+except Exception as e:
+    print(f"  {WARN}[WARN]{RESET}  Reading logs/crawler.log failed: {e}")
 PYEOF
 }
 
@@ -913,26 +1581,34 @@ check_status() {
     echo
     info "=== Service status ==="
     echo
+
+    # ── Crawler ──
+    # is_running() adopts an externally-started process if found via pgrep.
     if is_running; then
         local pid
         pid=$(cat "$PID_FILE")
-        success "Crawler is RUNNING  (PID $pid)"
-        echo
-        # Memory / CPU via ps
-        ps -p "$pid" -o pid,pcpu,pmem,etime,cmd --no-headers 2>/dev/null \
-            | awk '{printf "  PID: %s  CPU: %s%%  MEM: %s%%  Uptime: %s\n", $1,$2,$3,$4}' || true
+        local cmd
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null | head -1 || echo "n/a")
+        local started
+        started=$(ps -p "$pid" -o lstart= 2>/dev/null | xargs || echo "n/a")
+        success "Crawler     UP   │ PID $pid │ started: $started │ $cmd"
     else
-        warn "Crawler is NOT running."
+        warn    "Crawler     DOWN"
     fi
 
-    echo
-    info "=== Last 30 log lines ($LOG_FILE) ==="
-    echo
-    if [[ -f "$LOG_FILE" ]]; then
-        tail -30 "$LOG_FILE"
+    # ── Django admin ──
+    if is_admin_running; then
+        local apid
+        apid=$(cat "$ADMIN_PID_FILE")
+        local acmd
+        acmd=$(ps -p "$apid" -o command= 2>/dev/null | head -1 || echo "n/a")
+        local astarted
+        astarted=$(ps -p "$apid" -o lstart= 2>/dev/null | xargs || echo "n/a")
+        success "Django admin UP   │ PID $apid │ started: $astarted │ $acmd"
     else
-        warn "No log file found yet."
+        warn    "Django admin DOWN"
     fi
+
     echo
 }
 
@@ -951,9 +1627,11 @@ print_menu() {
     echo -e "  ${RED}6)${RESET} Stop all services     (crawler + Django admin)"
     echo -e "  ${CYAN}7)${RESET} Show DB stats         (size / crawled items / sources)"
     echo -e "  ${GREEN}8)${RESET} Install & initialize PostgreSQL"
+    echo -e "  ${CYAN}9)${RESET} Run test suite         (pytest tests/)"
+    echo -e "  ${CYAN}10)${RESET} Show full articles by track + WebSearch discovery queue status"
     echo -e "  ${RED}0)${RESET} Exit"
     echo
-    echo -n "  Select an option [0-8]: "
+    echo -n "  Select an option [0-10]: "
 }
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -972,6 +1650,8 @@ while true; do
         6) stop_all          ;;
         7) show_db_stats     ;;
         8) install_postgres  ;;
+        9) run_tests         ;;
+        10) show_track_stats ;;
         0)
             echo
             info "Goodbye."
@@ -979,7 +1659,7 @@ while true; do
             exit 0
             ;;
         *)
-            error "Invalid option '${choice}'. Please enter 0–8."
+            error "Invalid option '${choice}'. Please enter 0–10."
             ;;
     esac
 done

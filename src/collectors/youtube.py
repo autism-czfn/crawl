@@ -1,6 +1,7 @@
 """YouTube Data API v3 collector."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from src.collectors.base import CollectedItem
@@ -12,6 +13,54 @@ logger = logging.getLogger(__name__)
 _BASE = "https://www.googleapis.com/youtube/v3/search"
 _VIDEO_BASE = "https://www.googleapis.com/youtube/v3/videos"
 _CHANNELS_BASE = "https://www.googleapis.com/youtube/v3/channels"
+
+_MAX_TRANSCRIPT_CHARS = 50_000
+
+
+def _fetch_transcript(video_id: str) -> str | None:
+    """Fetch transcript for a YouTube video. Returns cleaned text or None.
+
+    Prefers manually created English captions; falls back to auto-generated.
+    Runs synchronously — call via asyncio.to_thread() from async context.
+    """
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
+    except ImportError:
+        logger.warning("youtube-transcript-api not installed — transcript fetch skipped")
+        return None
+
+    try:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+        # Prefer manual English, then auto-generated English, then any English
+        transcript = None
+        try:
+            transcript = transcript_list.find_manually_created_transcript(["en", "en-US", "en-GB"])
+        except NoTranscriptFound:
+            pass
+
+        if transcript is None:
+            try:
+                transcript = transcript_list.find_generated_transcript(["en", "en-US", "en-GB"])
+            except NoTranscriptFound:
+                pass
+
+        if transcript is None:
+            return None
+
+        segments = transcript.fetch()
+        text = " ".join(s.get("text", "") for s in segments).strip()
+        if not text:
+            return None
+
+        return text[:_MAX_TRANSCRIPT_CHARS]
+
+    except (NoTranscriptFound, TranscriptsDisabled):
+        logger.debug("No transcript available for video %s", video_id)
+        return None
+    except Exception as exc:
+        logger.debug("Transcript fetch failed for %s: %s", video_id, exc)
+        return None
 
 
 async def collect(
@@ -112,6 +161,11 @@ async def collect(
         description = snippet.get("description", "").strip() or None
         channel = snippet.get("channelTitle")
 
+        # Fetch transcript as content_body (falls back to None if unavailable)
+        transcript = await asyncio.to_thread(_fetch_transcript, vid_id)
+        if transcript:
+            logger.debug("Transcript fetched for %s (%d chars)", vid_id, len(transcript))
+
         items.append(
             CollectedItem(
                 title=title,
@@ -119,7 +173,7 @@ async def collect(
                 source="youtube",
                 external_id=vid_id,
                 description=description,
-                content_body=None,
+                content_body=transcript,
                 author=channel,
                 authors_json=None,
                 published_at=published_at,
