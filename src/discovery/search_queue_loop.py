@@ -34,7 +34,7 @@ from src.discovery.classifier import classify_domain
 from src.discovery.landing import land_search_queue_url
 from src.discovery.queue import surface_metadata_for_domain
 from src.discovery.surfaces_writer import append_surface_entry, build_auto_surface_entry
-from src.storage.db import AsyncSessionLocal
+from src.storage.db import SearchQueueSessionLocal
 from src.storage.models import SearchDiscoveryRequest
 
 logger = logging.getLogger(__name__)
@@ -98,6 +98,14 @@ _MIN_CONFIDENCE_TO_PROMOTE = "high"
 
 async def search_queue_loop() -> None:
     from src.health import register, heartbeat
+    if SearchQueueSessionLocal is None:
+        logger.error(
+            "search_queue_loop: SEARCH_QUEUE_DATABASE_URL is not configured — "
+            "search_discovery_requests now lives in search's own isolated DB "
+            "(crawl.txt §4/§10), not this service's primary database. Not "
+            "starting the loop."
+        )
+        return
     register("search_queue", _INTERVAL_SEC)
     logger.info("search discovery queue loop started (interval=%ds)", _INTERVAL_SEC)
     while True:
@@ -110,7 +118,7 @@ async def search_queue_loop() -> None:
 
 
 async def _run_one_cycle() -> None:
-    async with AsyncSessionLocal() as session:
+    async with SearchQueueSessionLocal() as session:
         await _recover_stuck_processing(session)
         await _expire_stale_pending(session)
         await session.commit()
@@ -150,7 +158,7 @@ async def _claim_batch() -> list[tuple[int, str, str | None, str | None, str | N
     'processing' in the same session, so a slow row in this batch can't
     get re-claimed by the next cycle before this one finishes with it."""
     now = datetime.now(tz=timezone.utc)
-    async with AsyncSessionLocal() as session:
+    async with SearchQueueSessionLocal() as session:
         result = await session.execute(
             select(
                 SearchDiscoveryRequest.id,
@@ -244,7 +252,7 @@ async def _try_classify_and_promote(
     confident yes is recorded out_of_scope with the model's reason — the
     same terminal status this domain would have gotten before this
     feature existed, just no longer silent about why."""
-    async with AsyncSessionLocal() as session:
+    async with SearchQueueSessionLocal() as session:
         promotions_today = await _count_promotions_last_24h(session)
     if promotions_today >= _MAX_AUTO_PROMOTIONS_PER_DAY:
         await _mark_out_of_scope(row_id, note="daily_cap_reached")
@@ -314,7 +322,7 @@ async def _count_promotions_last_24h(session) -> int:
 async def _stamp_classifier_fields(
     row_id: int, tier: int, confidence: str, reason: str, promoted_surface_key: str,
 ) -> None:
-    async with AsyncSessionLocal() as session:
+    async with SearchQueueSessionLocal() as session:
         await session.execute(
             update(SearchDiscoveryRequest)
             .where(SearchDiscoveryRequest.id == row_id)
@@ -348,7 +356,7 @@ def _compute_retry_update(
 
 async def _mark_done(row_id: int) -> None:
     now = datetime.now(tz=timezone.utc)
-    async with AsyncSessionLocal() as session:
+    async with SearchQueueSessionLocal() as session:
         await session.execute(
             update(SearchDiscoveryRequest)
             .where(SearchDiscoveryRequest.id == row_id)
@@ -365,7 +373,7 @@ async def _mark_out_of_scope(
     classifier_reason: str | None = None,
 ) -> None:
     now = datetime.now(tz=timezone.utc)
-    async with AsyncSessionLocal() as session:
+    async with SearchQueueSessionLocal() as session:
         await session.execute(
             update(SearchDiscoveryRequest)
             .where(SearchDiscoveryRequest.id == row_id)
@@ -384,7 +392,7 @@ async def _mark_out_of_scope(
 
 async def _mark_failed(row_id: int, reason: str | None) -> None:
     now = datetime.now(tz=timezone.utc)
-    async with AsyncSessionLocal() as session:
+    async with SearchQueueSessionLocal() as session:
         result = await session.execute(
             select(SearchDiscoveryRequest.retry_count).where(SearchDiscoveryRequest.id == row_id)
         )

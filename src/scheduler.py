@@ -323,7 +323,7 @@ def _is_due(surface: Surface, now: datetime) -> bool:
 async def log_health_metrics() -> None:
     """Emit structured JSON health metrics every hour."""
     import json
-    from src.health import register, heartbeat
+    from src.health import register, heartbeat, get_article_counts
     register("health_metrics", 3600)
     metrics_logger = logging.getLogger("crawl.metrics")
     while True:
@@ -348,11 +348,21 @@ async def log_health_metrics() -> None:
                     .where(_Surface.consecutive_fails > 3)
                 )
 
+            article_counts = get_article_counts()
             metrics_logger.info(json.dumps({
                 "metric": "crawl_health",
                 "embedding_queue_depth": embedding_queue,
                 "chunk_queue_depth": chunk_queue,
                 "surfaces_failing": fail_surfaces,
+                # Reuses health.py's own 60s-refreshed cache (see
+                # _article_counts_loop) instead of a second full-table scan
+                # here — same numbers /api/health serves, just logged hourly
+                # so a drop like the one investigated on 2026-09-22 (total
+                # visibly down between two manual checks a few hours apart,
+                # with no historical log to pin down when/how much) can
+                # actually be traced afterwards instead of only noticed live.
+                "full_articles_total": article_counts.full_articles_total,
+                "full_articles_last_24h": article_counts.full_articles_last_24h,
             }))
         except Exception as exc:
             metrics_logger.error("Health metrics error: %s", exc)

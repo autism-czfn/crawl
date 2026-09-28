@@ -8,6 +8,13 @@ class Settings:
     DATABASE_URL: str = os.getenv("DATABASE_URL", "")
     DATABASE_URL_SYNC: str = os.getenv("DATABASE_URL_SYNC", "")
 
+    # Separate, isolated DB search owns (search_discovery_queue on search's
+    # own host) — see crawl.txt §4/§5.2/§10. Empty means the search-queue
+    # loop can't run yet (src/storage/db.py's SearchQueueSessionLocal stays
+    # None); this is intentional, not an error, for a deployment that
+    # hasn't been wired up to it yet.
+    SEARCH_QUEUE_DATABASE_URL: str = os.getenv("SEARCH_QUEUE_DATABASE_URL", "")
+
     REDDIT_CLIENT_ID: str = os.getenv("REDDIT_CLIENT_ID", "")
     REDDIT_CLIENT_SECRET: str = os.getenv("REDDIT_CLIENT_SECRET", "")
 

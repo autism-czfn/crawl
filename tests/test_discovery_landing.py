@@ -1,4 +1,4 @@
-from src.discovery.landing import _passes_domain_allowlist, _surface_key_for_pair
+from src.discovery.landing import _passes_domain_allowlist, _surface_key_for_pair, _title_from_pdf
 
 
 def test_passes_domain_allowlist_exact_and_subdomain():
@@ -26,3 +26,21 @@ def test_surface_key_for_pair_topic_none_uses_the_search_queue_namespace():
     # someone could later name "None".
     assert _surface_key_for_pair("cdc.gov", None) == "discovery_search_cdc.gov"
     assert _surface_key_for_pair("cdc.gov", None) != _surface_key_for_pair("cdc.gov", "None")
+
+
+def test_title_from_pdf_uses_first_line_when_it_looks_like_a_title():
+    text = "A Randomized Trial of Something\nBody text follows here..."
+    assert _title_from_pdf(text, "https://example.com/doc.pdf") == "A Randomized Trial of Something"
+
+
+def test_title_from_pdf_falls_back_to_filename_when_first_line_is_unusable():
+    # First "line" too short to be a real title (e.g. a page header/logo
+    # artifact) — falls back to a cleaned-up filename instead.
+    text = "Fig 1\nBody text follows here..."
+    url = "https://cdn.clinicaltrials.gov/large-docs/54/NCT03911154/Prot_SAP_ICF_001.pdf"
+    assert _title_from_pdf(text, url) == "Prot SAP ICF 001"
+
+
+def test_title_from_pdf_falls_back_to_url_when_nothing_usable_is_left():
+    # No extracted text AND no filename in the path to fall back to.
+    assert _title_from_pdf("", "https://example.com/") == "https://example.com/"

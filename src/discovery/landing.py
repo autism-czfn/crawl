@@ -17,8 +17,10 @@ pipeline, no LLM-authored body/summary.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -27,6 +29,7 @@ from sqlalchemy import or_, select
 from src.collectors.base import CollectedItem
 from src.collectors.fulltext import fetch_pmc_fulltext
 from src.collectors.sitemap import _extract_page
+from src.extractors.pdf import extract_text_from_pdf
 from src.http.client import get_shared_client
 from src.pipeline import _normalize_url, save_items
 from src.storage.db import AsyncSessionLocal
@@ -196,6 +199,19 @@ async def _already_known(session, url: str) -> bool:
     return result.first() is not None
 
 
+def _title_from_pdf(text: str, url: str) -> str:
+    """A landed PDF has no HTML <title>/og:title to pull from (unlike the
+    _extract_page path below) — best-effort title from the extracted
+    text's own first line, falling back to a cleaned-up filename when
+    that line is empty or clearly not a title (too short/too long)."""
+    first_line = text.strip().splitlines()[0].strip() if text.strip() else ""
+    if 8 <= len(first_line) <= 200:
+        return first_line
+    filename = urlparse(url).path.rsplit("/", 1)[-1]
+    stem = re.sub(r"\.pdf$", "", filename, flags=re.IGNORECASE)
+    return re.sub(r"[_\-]+", " ", stem).strip() or url
+
+
 async def _land_pmc_url(
     session, client, url: str, numeric_id: str, surface_key: str, source: str,
 ) -> tuple[str, str | None]:
@@ -281,10 +297,47 @@ async def land_one_url(
         logger.warning("discovery: unexpected fetch error for %s: %s", url, exc)
         return "failed", "fetch_failed"
 
-    soup = BeautifulSoup(page_resp.text, "html.parser")
-    item = _extract_page(soup, url)
-    if not item:
+    # BUG FIXED 2026-09-26: this used to hand page_resp.text straight to
+    # BeautifulSoup regardless of what was actually fetched — a discovered
+    # URL isn't guaranteed to be HTML just because it passed the domain/
+    # dedup gates above. Confirmed live: a clinicaltrials.gov large-docs
+    # link served a raw PDF, and BeautifulSoup's html.parser choked trying
+    # to interpret its binary bytes as an HTML character reference
+    # (ValueError: invalid literal for int() ...), erroring this loop on
+    # every retry. Same content-type check pipeline.py's enrich_fulltext
+    # already uses for exactly this reason.
+    content_type = page_resp.headers.get("content-type", "")
+    if "application/pdf" in content_type:
+        text = await asyncio.to_thread(extract_text_from_pdf, page_resp.content)
+        if not text:
+            return "failed", "extract_failed"
+        item: CollectedItem = {
+            "title": _title_from_pdf(text, url),
+            "url": url,
+            "source": source,
+            "external_id": None,
+            "description": None,
+            "content_body": text,
+            "author": None,
+            "authors_json": None,
+            "published_at": None,
+            "rank_position": None,
+            "doi": None,
+            "journal": domain,
+            "open_access": None,
+            "engagement": {},
+            "raw_payload": {},
+        }
+    elif content_type and "html" not in content_type and "text/" not in content_type:
+        # Some other binary format (image, video, zip, ...) — nothing to
+        # extract, and would hit the same BeautifulSoup crash as the PDF
+        # case above.
         return "failed", "extract_failed"
+    else:
+        soup = BeautifulSoup(page_resp.text, "html.parser")
+        item = _extract_page(soup, url)
+        if not item:
+            return "failed", "extract_failed"
     item["source"] = source
     inserted = await save_items([item], surface_key, session)
     if inserted:

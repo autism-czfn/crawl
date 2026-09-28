@@ -73,6 +73,13 @@ class ArticleCounts:
 _article_counts = ArticleCounts()
 
 
+def get_article_counts() -> ArticleCounts:
+    """Read-only snapshot of the cached counts — for other loops (e.g.
+    scheduler.log_health_metrics) that want to log this trend over time
+    without paying for their own full-table scan."""
+    return _article_counts
+
+
 def register(name: str, expected_interval_seconds: float, stale_multiplier: float = 3.0) -> None:
     """Call once, right before a loop's `while True:`. stale_multiplier gives
     slow iterations (a big surface batch, a slow upstream API) room before
