@@ -14,8 +14,6 @@ _BASE = "https://www.googleapis.com/youtube/v3/search"
 _VIDEO_BASE = "https://www.googleapis.com/youtube/v3/videos"
 _CHANNELS_BASE = "https://www.googleapis.com/youtube/v3/channels"
 
-_MAX_TRANSCRIPT_CHARS = 50_000
-
 
 def _fetch_transcript(video_id: str) -> str | None:
     """Fetch transcript for a YouTube video. Returns cleaned text or None.
@@ -53,7 +51,7 @@ def _fetch_transcript(video_id: str) -> str | None:
         if not text:
             return None
 
-        return text[:_MAX_TRANSCRIPT_CHARS]
+        return text
 
     except (NoTranscriptFound, TranscriptsDisabled):
         logger.debug("No transcript available for video %s", video_id)

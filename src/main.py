@@ -81,12 +81,16 @@ async def main() -> None:
         loop.add_signal_handler(sig, _on_signal, sig)
 
     tasks = [
+        # scheduler.run() / discovery_loop() were temporarily disabled
+        # 2026-10-02 to 2026-10-05 to prioritize a one-time backfill
+        # (backfill_truncated_content, since completed and removed — see
+        # git history). Re-enabled 2026-10-05 now that the backfill is done.
         asyncio.create_task(scheduler.run()),
+        asyncio.create_task(discovery_loop()),
         asyncio.create_task(embedding_loop()),
         asyncio.create_task(chunk_loop()),
         asyncio.create_task(enrich_fulltext_loop()),
         asyncio.create_task(log_health_metrics()),
-        asyncio.create_task(discovery_loop()),
         asyncio.create_task(search_queue_loop()),
         asyncio.create_task(health_serve(settings.HEALTH_HOST, settings.HEALTH_PORT)),
     ]

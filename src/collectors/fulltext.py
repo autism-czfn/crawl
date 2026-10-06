@@ -20,17 +20,16 @@ import xml.etree.ElementTree as ET
 logger = logging.getLogger(__name__)
 
 _MIN_CHARS = 300          # discard anything shorter
-_MAX_CHARS = 50_000       # cap stored text
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _clean(text: str) -> str | None:
-    """Strip whitespace and enforce min/max length."""
+    """Strip whitespace and enforce min length."""
     text = " ".join(text.split()).strip()
     if len(text) < _MIN_CHARS:
         return None
-    return text[:_MAX_CHARS]
+    return text
 
 
 async def _fetch_bytes(client, url: str) -> bytes | None:

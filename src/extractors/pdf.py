@@ -14,9 +14,6 @@ import re
 
 logger = logging.getLogger(__name__)
 
-_MAX_CHARS = 50_000
-
-
 def extract_text_from_pdf(content: bytes) -> str | None:
     """Extract text from PDF bytes.
 
@@ -28,8 +25,8 @@ def extract_text_from_pdf(content: bytes) -> str | None:
     Returns
     -------
     str
-        Extracted text, capped at 50,000 characters. Empty string '' means
-        the PDF was scanned/image-only or produced no usable text (permanent failure).
+        Extracted text, uncapped. Empty string '' means the PDF was
+        scanned/image-only or produced no usable text (permanent failure).
     None
         Extraction not attempted (pdfplumber not installed, or PDF is locked/
         encrypted and raises an exception before any text could be read).
@@ -69,7 +66,7 @@ def extract_text_from_pdf(content: bytes) -> str | None:
             full_text = full_text[: ref_match.start()]
 
         full_text = re.sub(r"\s+", " ", full_text).strip()
-        return full_text[:_MAX_CHARS] if full_text else ""
+        return full_text if full_text else ""
 
     except Exception as exc:
         logger.warning("PDF extraction failed (locked or corrupt PDF): %s", exc)

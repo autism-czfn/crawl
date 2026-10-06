@@ -77,7 +77,7 @@ async def collect(
             for page in pages.values():
                 raw_extract = page.get("extract", "")
                 if raw_extract and len(raw_extract) > 300:
-                    content_body = raw_extract[:50_000]  # cap at 50K chars
+                    content_body = raw_extract
                     break
         except Exception as exc:
             logger.debug("Wikipedia full-article fetch failed for '%s': %s", title, exc)
